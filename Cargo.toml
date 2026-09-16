@@ -8,8 +8,8 @@ version = "2.0.0-rc.1"
 [workspace.dependencies]
 base64 = "0.23.1"
 chrono = { version = "0.4.45", features = ["serde"] }
-nostr = { version = "=0.45.4", features = ["std", "os-rng", "nip04", "nip44", "nip46"] }
-nostr-sdk = "=0.45.2"
+nostr = { version = "=0.45.5", features = ["std", "os-rng", "nip04", "nip44", "nip46"] }
+nostr-sdk = "=0.45.3"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sqlx = { package = "sqlx-core", version = "0.9.0", default-features = false, features = [ "_rt-tokio", "migrate", "chrono", "json" ] }
