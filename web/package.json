@@ -19,7 +19,7 @@
 		"@types/bun": "1.4.0",
 		"@typescript/native": "npm:typescript@7.0.2",
 		"postcss": "8.5.28",
-		"rollup": "4.63.1",
+		"rollup": "4.63.2",
 		"svelte": "5.57.0",
 		"svelte-check": "4.7.6",
 		"svelte-hot-french-toast": "4.0.0",
