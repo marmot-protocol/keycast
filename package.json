@@ -20,7 +20,7 @@
 		"key:generate": "./scripts/generate_key.sh"
 	},
 	"devDependencies": {
-		"@socketsecurity/bun-security-scanner": "1.1.2",
+		"@socketsecurity/bun-security-scanner": "1.1.3",
 		"concurrently": "10.0.5"
 	},
 	"dependencies": {
