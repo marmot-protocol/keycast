@@ -21,7 +21,7 @@
 	},
 	"devDependencies": {
 		"@socketsecurity/bun-security-scanner": "1.1.2",
-		"concurrently": "10.0.5"
+		"concurrently": "10.0.6"
 	},
 	"dependencies": {
 		"@types/bun": "1.4.0"
