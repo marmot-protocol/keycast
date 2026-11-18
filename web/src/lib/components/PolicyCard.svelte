@@ -1,5 +1,5 @@
 <script lang="ts">
-    import type { Policy } from "$lib/types";
+    import type { Policy } from "#lib/types";
     import { PencilSimple, Trash } from "phosphor-svelte";
 
     let {

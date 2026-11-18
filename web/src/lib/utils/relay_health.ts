@@ -1,4 +1,4 @@
-import type { RelayStatus } from "$lib/types";
+import type { RelayStatus } from "#lib/types";
 
 export function relayHealth(relay: RelayStatus): {
     label: string;

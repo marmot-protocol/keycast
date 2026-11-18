@@ -1,8 +1,8 @@
 <script lang="ts">
-    import { page } from "$app/stores";
-    import SignInMenu from "$lib/components/SignInMenu.svelte";
-    import { getCurrentUser } from "$lib/current_user.svelte";
-    import { signout } from "$lib/utils/auth";
+    import { page } from "$app/state";
+    import SignInMenu from "#lib/components/SignInMenu.svelte";
+    import { getCurrentUser } from "#lib/current_user.svelte";
+    import { signout } from "#lib/utils/auth";
     import { Key, SignOut } from "phosphor-svelte";
     const user = $derived(getCurrentUser()?.user);
 </script>
@@ -16,17 +16,17 @@
             {#if user}
                 <a
                     class="nav-link"
-                    class:active={$page.url.pathname.startsWith("/teams")}
+                    class:active={page.url.pathname.startsWith("/teams")}
                     href="/teams"
-                    aria-current={$page.url.pathname.startsWith("/teams")
+                    aria-current={page.url.pathname.startsWith("/teams")
                         ? "page"
                         : undefined}>Workspace</a
                 >
                 <a
                     class="nav-link"
-                    class:active={$page.url.pathname === "/status"}
+                    class:active={page.url.pathname === "/status"}
                     href="/status"
-                    aria-current={$page.url.pathname === "/status"
+                    aria-current={page.url.pathname === "/status"
                         ? "page"
                         : undefined}>Instance</a
                 >

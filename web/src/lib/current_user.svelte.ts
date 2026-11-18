@@ -1,4 +1,4 @@
-import { userFromPubkey, type NostrUser } from "$lib/nostr";
+import { userFromPubkey, type NostrUser } from "#lib/nostr";
 
 let currentUser: CurrentUser | null = $state(null);
 

@@ -4,14 +4,14 @@
         teamPath,
         teamSectionPath,
         workspaceSection,
-    } from "$lib/utils/team_url";
-    import { page } from "$app/stores";
+    } from "#lib/utils/team_url";
+    import { page } from "$app/state";
     import { goto } from "$app/navigation";
-    import { getCurrentUser } from "$lib/current_user.svelte";
-    import { KeycastApi } from "$lib/keycast_api.svelte";
-    import type { TeamWithRelations } from "$lib/types";
-    import TeamWorkspace from "$lib/components/TeamWorkspace.svelte";
-    import Loader from "$lib/components/Loader.svelte";
+    import { getCurrentUser } from "#lib/current_user.svelte";
+    import { KeycastApi } from "#lib/keycast_api.svelte";
+    import type { TeamWithRelations } from "#lib/types";
+    import TeamWorkspace from "#lib/components/TeamWorkspace.svelte";
+    import Loader from "#lib/components/Loader.svelte";
     import { Plus, SquaresFour } from "phosphor-svelte";
     let { teamId }: { teamId?: string } = $props();
     const api = new KeycastApi();
@@ -19,7 +19,7 @@
     let teams = $state<TeamWithRelations[]>([]);
     const selected = $derived(teamId);
     const section = $derived(
-        workspaceSection($page.url.searchParams.get("section")),
+        workspaceSection(page.url.searchParams.get("section")),
     );
     let loading = $state(true);
     let startedFor = $state("");
@@ -39,7 +39,7 @@
     $effect(() => {
         if (activeTeam?.team.slug && selected !== activeTeam.team.slug) {
             void goto(
-                `${teamPath(activeTeam.team)}${$page.url.search}${$page.url.hash}`,
+                `${teamPath(activeTeam.team)}${page.url.search}${page.url.hash}`,
                 { replaceState: true },
             );
         }

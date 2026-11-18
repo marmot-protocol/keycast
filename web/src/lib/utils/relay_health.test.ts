@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { relayHealth } from "./relay_health";
-import type { RelayStatus } from "$lib/types";
+import type { RelayStatus } from "#lib/types";
 
 const relay: RelayStatus = {
     discovered: false,

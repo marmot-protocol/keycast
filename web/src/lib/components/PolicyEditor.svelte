@@ -1,14 +1,14 @@
 <script lang="ts">
     import { goto } from "$app/navigation";
-    import { getCurrentUser } from "$lib/current_user.svelte";
-    import { KeycastApi } from "$lib/keycast_api.svelte";
+    import { getCurrentUser } from "#lib/current_user.svelte";
+    import { KeycastApi } from "#lib/keycast_api.svelte";
     import type {
         Policy,
         PolicyDocument,
         TeamWithRelations,
-    } from "$lib/types";
+    } from "#lib/types";
     import PolicyPermissions from "./PolicyPermissions.svelte";
-    import { buildDocument, createEditorState } from "$lib/policy/editor";
+    import { buildDocument, createEditorState } from "#lib/policy/editor";
     import { toast } from "svelte-hot-french-toast";
 
     let {

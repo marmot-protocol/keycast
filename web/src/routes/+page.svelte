@@ -1,6 +1,6 @@
 <script lang="ts">
-    import SignInMenu from "$lib/components/SignInMenu.svelte";
-    import { getCurrentUser } from "$lib/current_user.svelte";
+    import SignInMenu from "#lib/components/SignInMenu.svelte";
+    import { getCurrentUser } from "#lib/current_user.svelte";
     import { ArrowRight } from "phosphor-svelte";
     const user = $derived(getCurrentUser()?.user);
 </script>

@@ -1,8 +1,8 @@
 <script lang="ts">
     import "../app.css";
-    import Header from "$lib/components/Header.svelte";
-    import { getCurrentUser, setCurrentUser } from "$lib/current_user.svelte";
-    import { initApi } from "$lib/keycast_api.svelte";
+    import Header from "#lib/components/Header.svelte";
+    import { getCurrentUser, setCurrentUser } from "#lib/current_user.svelte";
+    import { initApi } from "#lib/keycast_api.svelte";
     import { untrack } from "svelte";
     import { Toaster } from "svelte-hot-french-toast";
 

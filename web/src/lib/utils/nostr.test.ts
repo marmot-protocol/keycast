@@ -9,7 +9,7 @@ import {
     normalizeBunkerUri,
     setActiveSigner,
     signNostrEvent,
-} from "$lib/nostr";
+} from "#lib/nostr";
 import { truncatedNpubForPubkey, userFromPubkeyOrNpub } from "./nostr";
 
 const PUBKEY =

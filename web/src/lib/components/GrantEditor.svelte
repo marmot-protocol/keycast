@@ -1,16 +1,16 @@
 <script lang="ts">
-    import Copy from "$lib/components/Copy.svelte";
-    import Loader from "$lib/components/Loader.svelte";
-    import PolicyCard from "$lib/components/PolicyCard.svelte";
-    import { getCurrentUser } from "$lib/current_user.svelte";
-    import { KeycastApi } from "$lib/keycast_api.svelte";
+    import Copy from "#lib/components/Copy.svelte";
+    import Loader from "#lib/components/Loader.svelte";
+    import PolicyCard from "#lib/components/PolicyCard.svelte";
+    import { getCurrentUser } from "#lib/current_user.svelte";
+    import { KeycastApi } from "#lib/keycast_api.svelte";
     import type {
         GrantCreationResponse,
         Policy,
         StoredKey,
         Team,
         TeamWithRelations,
-    } from "$lib/types";
+    } from "#lib/types";
     import { X } from "phosphor-svelte";
     import { toast } from "svelte-hot-french-toast";
 

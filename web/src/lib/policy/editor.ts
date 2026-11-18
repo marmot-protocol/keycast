@@ -1,4 +1,4 @@
-import type { PolicyDocument, RecipientScope } from "$lib/types";
+import type { PolicyDocument, RecipientScope } from "#lib/types";
 import { CRYPTO_METHODS, POLICY_USE_CASES, type CryptoMethod, type CryptoPermissions, type PolicyUseCase } from "./catalog";
 
 export type EditorState = {

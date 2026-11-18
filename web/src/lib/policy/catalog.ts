@@ -1,4 +1,4 @@
-import type { RecipientScope } from "$lib/types";
+import type { RecipientScope } from "#lib/types";
 
 export const CRYPTO_METHODS = ["nip44_encrypt", "nip44_decrypt", "nip04_encrypt", "nip04_decrypt"] as const;
 export type CryptoMethod = (typeof CRYPTO_METHODS)[number];

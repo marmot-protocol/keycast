@@ -1,6 +1,6 @@
-import type { Handle } from "@sveltejs/kit";
-import { cspHeaderValue } from "$lib/server/csp.js";
-import { isProtectedRoute } from "$lib/utils/routes";
+import type { Handle } from "@sveltejs/kit/hooks";
+import { cspHeaderValue } from "#lib/server/csp.js";
+import { isProtectedRoute } from "#lib/utils/routes";
 
 function applySecurityHeaders(response: Response, event: Parameters<Handle>[0]["event"]) {
     if (!response.headers.has("Content-Security-Policy")) {

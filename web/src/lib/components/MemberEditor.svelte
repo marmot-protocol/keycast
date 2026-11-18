@@ -1,9 +1,9 @@
 <script lang="ts">
     import UserIdentity from "./UserIdentity.svelte";
     import { goto } from "$app/navigation";
-    import { getCurrentUser } from "$lib/current_user.svelte";
-    import { KeycastApi } from "$lib/keycast_api.svelte";
-    import { userFromPubkeyOrNpub } from "$lib/utils/nostr";
+    import { getCurrentUser } from "#lib/current_user.svelte";
+    import { KeycastApi } from "#lib/keycast_api.svelte";
+    import { userFromPubkeyOrNpub } from "#lib/utils/nostr";
     let { id, onSaved }: { id: string; onSaved?: () => void | Promise<void> } =
         $props();
     const api = new KeycastApi();
