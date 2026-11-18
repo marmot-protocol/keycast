@@ -16,7 +16,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && install -Dm755 target/release/keycast_api /out/keycast_api \
     && install -Dm755 target/release/keycast_signer /out/keycast_signer
 
-FROM oven/bun:1.3.9@sha256:856da45d07aeb62eb38ea3e7f9e1794c0143a4ff63efb00e6c4491b627e2a521 AS web-builder
+FROM oven/bun:1.4.4@sha256:1d22548f177f4ff38e0c15baa3c2c46c6c2060ba2d1bc573bb4720b407548f1d AS web-builder
 ARG KEYCAST_BUILD_REVISION=development
 ENV KEYCAST_BUILD_REVISION=${KEYCAST_BUILD_REVISION}
 WORKDIR /app
@@ -28,7 +28,7 @@ RUN --mount=type=cache,target=/root/.bun/install/cache bun install --frozen-lock
 COPY web ./
 RUN bun run check && bun run build
 
-FROM oven/bun:1.3.9@sha256:856da45d07aeb62eb38ea3e7f9e1794c0143a4ff63efb00e6c4491b627e2a521 AS web-runtime-deps
+FROM oven/bun:1.4.4@sha256:1d22548f177f4ff38e0c15baa3c2c46c6c2060ba2d1bc573bb4720b407548f1d AS web-runtime-deps
 WORKDIR /app
 COPY web/package.json web/bun.lockb ./
 RUN bun install --production --frozen-lockfile

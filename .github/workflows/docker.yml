@@ -52,7 +52,7 @@ jobs:
         run: python3 scripts/releases/release.py wait-ci --sha "$GITHUB_SHA"
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       # Gate the code before anything is pushed, including on a branch dispatch
       # where no publication happens at all.
@@ -68,7 +68,7 @@ jobs:
 
       - name: Log in to GitHub Container Registry
         if: github.ref == 'refs/heads/master'
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -83,7 +83,7 @@ jobs:
       - name: Push API image to its candidate tag
         if: github.ref == 'refs/heads/master'
         id: api
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           target: api-runtime
@@ -99,7 +99,7 @@ jobs:
       - name: Push signer image to its candidate tag
         if: github.ref == 'refs/heads/master'
         id: signer
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           target: signer-runtime
@@ -115,7 +115,7 @@ jobs:
       - name: Push web image to its candidate tag
         if: github.ref == 'refs/heads/master'
         id: web
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           target: web-runtime
@@ -178,7 +178,7 @@ jobs:
 
       - name: Preserve candidate for explicit release
         if: github.ref == 'refs/heads/master'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.0
         with:
           name: release-candidate
           path: release-candidate/*
