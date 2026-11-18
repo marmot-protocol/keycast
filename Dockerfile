@@ -33,7 +33,7 @@ WORKDIR /app
 COPY web/package.json web/bun.lockb ./
 RUN bun install --production --frozen-lockfile
 
-FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171 AS rust-runtime-base
+FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc AS rust-runtime-base
 ARG KEYCAST_VERSION=development
 ARG KEYCAST_BUILD_REVISION=development
 LABEL org.opencontainers.image.version=${KEYCAST_VERSION} \
