@@ -1,11 +1,11 @@
 <script lang="ts">
-    import { page } from "$app/stores";
+    import { page } from "$app/state";
     import { goto } from "$app/navigation";
     import type { Snippet } from "svelte";
-    import { getCurrentUser } from "$lib/current_user.svelte";
-    import { KeycastApi } from "$lib/keycast_api.svelte";
-    import type { TeamWithRelations } from "$lib/types";
-    import { resolveTeam, teamPath } from "$lib/utils/team_url";
+    import { getCurrentUser } from "#lib/current_user.svelte";
+    import { KeycastApi } from "#lib/keycast_api.svelte";
+    import type { TeamWithRelations } from "#lib/types";
+    import { resolveTeam, teamPath } from "#lib/utils/team_url";
     import Loader from "./Loader.svelte";
 
     let { children }: { children: Snippet<[string, string]> } = $props();
@@ -13,7 +13,7 @@
     let teams = $state<TeamWithRelations[]>([]);
     let loading = $state(true);
     let error = $state("");
-    const selected = $derived(resolveTeam(teams, $page.params.id));
+    const selected = $derived(resolveTeam(teams, page.params.id));
     const api = new KeycastApi();
     $effect(() => {
         const actor = user?.pubkey;
@@ -46,10 +46,10 @@
         };
     });
     $effect(() => {
-        if (selected?.team.slug && $page.params.id !== selected.team.slug) {
-            const suffix = $page.url.pathname.split("/").slice(3).join("/");
+        if (selected?.team.slug && page.params.id !== selected.team.slug) {
+            const suffix = page.url.pathname.split("/").slice(3).join("/");
             void goto(
-                `${teamPath(selected.team)}${suffix ? `/${suffix}` : ""}${$page.url.search}${$page.url.hash}`,
+                `${teamPath(selected.team)}${suffix ? `/${suffix}` : ""}${page.url.search}${page.url.hash}`,
                 { replaceState: true },
             );
         }

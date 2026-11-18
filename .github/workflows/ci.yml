@@ -154,6 +154,8 @@ jobs:
           bun audit
           bun pm scan
           cd web
-          bun audit
+          # GHSA-fc5q-39xc-vjpf (picomatch ReDoS) has no patched release yet;
+          # picomatch is a build-time dependency only. Drop this ignore once a fix ships.
+          bun audit --ignore=GHSA-fc5q-39xc-vjpf
           bun pm scan
           bun pm untrusted

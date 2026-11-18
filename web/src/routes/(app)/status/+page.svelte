@@ -1,11 +1,11 @@
 <script lang="ts">
-    import { softwareVersion, buildRevision } from "$lib/version";
-    import RelayHealthRow from "$lib/components/RelayHealthRow.svelte";
-    import Loader from "$lib/components/Loader.svelte";
-    import { getCurrentUser } from "$lib/current_user.svelte";
-    import { KeycastApi } from "$lib/keycast_api.svelte";
-    import type { StatusResponse } from "$lib/types";
-    import { formattedUnixDateTime } from "$lib/utils/dates";
+    import { softwareVersion, buildRevision } from "#lib/version";
+    import RelayHealthRow from "#lib/components/RelayHealthRow.svelte";
+    import Loader from "#lib/components/Loader.svelte";
+    import { getCurrentUser } from "#lib/current_user.svelte";
+    import { KeycastApi } from "#lib/keycast_api.svelte";
+    import type { StatusResponse } from "#lib/types";
+    import { formattedUnixDateTime } from "#lib/utils/dates";
     import {
         ArrowClockwise,
         CheckCircle,
@@ -17,7 +17,7 @@
         managementReplyFingerprint,
         pinnedManagementReplyKey,
         trustManagementReplyKey,
-    } from "$lib/utils/reply_identity";
+    } from "#lib/utils/reply_identity";
 
     const api = new KeycastApi();
     const user = $derived(getCurrentUser()?.user);

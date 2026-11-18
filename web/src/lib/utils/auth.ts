@@ -1,11 +1,11 @@
 import { goto } from "$app/navigation";
-import { getCurrentUser, setCurrentUser } from "$lib/current_user.svelte";
+import { getCurrentUser, setCurrentUser } from "#lib/current_user.svelte";
 import {
     clearActiveSigner,
     connectNostrConnectBunker,
     getExtensionUser,
     type NostrUser,
-} from "$lib/nostr";
+} from "#lib/nostr";
 import toast from "svelte-hot-french-toast";
 import { checkPubkeyAllowed } from "./allowlist";
 import { signinDestination } from "./routes";

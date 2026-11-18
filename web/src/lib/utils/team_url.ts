@@ -1,4 +1,4 @@
-import type { Team, TeamWithRelations } from "$lib/types";
+import type { Team, TeamWithRelations } from "#lib/types";
 
 export function teamPath(team: Pick<Team, "id" | "slug">): string {
     return `/teams/${encodeURIComponent(team.slug || String(team.id))}`;

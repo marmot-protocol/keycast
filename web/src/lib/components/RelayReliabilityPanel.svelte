@@ -1,6 +1,6 @@
 <script lang="ts">
-    import type { RelayReliability, RelayReliabilityCounts } from "$lib/types";
-    import { formattedUnixDateTime } from "$lib/utils/dates";
+    import type { RelayReliability, RelayReliabilityCounts } from "#lib/types";
+    import { formattedUnixDateTime } from "#lib/utils/dates";
     let { reliability }: { reliability: RelayReliability | null } = $props();
     const rows: [keyof RelayReliabilityCounts, string][] = [
         ["attempts", "Connection attempts"],

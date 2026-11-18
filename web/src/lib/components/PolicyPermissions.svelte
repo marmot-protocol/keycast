@@ -1,8 +1,8 @@
 <script lang="ts">
     import { tick } from "svelte";
-    import { CRYPTO_METHODS, POLICY_USE_CASES, type CryptoMethod } from "$lib/policy/catalog";
-    import { canAddKind, createEditorState, cryptoScope, cryptoSuggestions, defaultKinds, disableKindsEverywhere, kindName, kindSources, searchUseCases, selectUseCase, setKinds, signingKinds, type EditorState } from "$lib/policy/editor";
-    import type { RecipientScope } from "$lib/types";
+    import { CRYPTO_METHODS, POLICY_USE_CASES, type CryptoMethod } from "#lib/policy/catalog";
+    import { canAddKind, createEditorState, cryptoScope, cryptoSuggestions, defaultKinds, disableKindsEverywhere, kindName, kindSources, searchUseCases, selectUseCase, setKinds, signingKinds, type EditorState } from "#lib/policy/editor";
+    import type { RecipientScope } from "#lib/types";
 
     let { value = $bindable(createEditorState()) }: { value: EditorState } = $props();
     const uid = $props.id();

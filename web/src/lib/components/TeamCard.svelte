@@ -1,7 +1,7 @@
 <script lang="ts">
-    import { teamPath } from "$lib/utils/team_url";
-    import type { TeamWithRelations } from "$lib/types";
-    import { dateFromUnixSeconds, formattedDate } from "$lib/utils/dates";
+    import { teamPath } from "#lib/utils/team_url";
+    import type { TeamWithRelations } from "#lib/types";
+    import { dateFromUnixSeconds, formattedDate } from "#lib/utils/dates";
 
     let { team }: { team: TeamWithRelations } = $props();
 </script>

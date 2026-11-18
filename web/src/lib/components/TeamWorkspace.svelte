@@ -2,18 +2,18 @@
     import {
         teamSectionPath,
         type WorkspaceSection,
-    } from "$lib/utils/team_url";
+    } from "#lib/utils/team_url";
     import { onMount } from "svelte";
     import UserIdentity from "./UserIdentity.svelte";
-    import { getCurrentUser } from "$lib/current_user.svelte";
-    import { KeycastApi } from "$lib/keycast_api.svelte";
+    import { getCurrentUser } from "#lib/current_user.svelte";
+    import { KeycastApi } from "#lib/keycast_api.svelte";
     import type {
         Team,
         TeamWithRelations,
         AuditEvent,
         Policy,
         User,
-    } from "$lib/types";
+    } from "#lib/types";
     import KeyPanel from "./KeyPanel.svelte";
     import KeyImport from "./KeyImport.svelte";
     import MemberEditor from "./MemberEditor.svelte";
@@ -34,7 +34,7 @@
         formattedUnixDateTime,
         formattedDate,
         dateFromUnixSeconds,
-    } from "$lib/utils/dates";
+    } from "#lib/utils/dates";
     import { toast } from "svelte-hot-french-toast";
 
     let {

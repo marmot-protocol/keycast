@@ -5,13 +5,13 @@
         isAmberSigninSupported,
         type NostrConnectSigninOptions,
         type NostrConnectSigninSession,
-    } from "$lib/nostr";
+    } from "#lib/nostr";
     import {
         completeSignin,
         signin,
         type SigninMethod,
         type SigninOptions,
-    } from "$lib/utils/auth";
+    } from "#lib/utils/auth";
     import {
         Browser,
         Check,

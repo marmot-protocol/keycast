@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import type { TeamWithRelations } from "$lib/types";
+import type { TeamWithRelations } from "#lib/types";
 import {
     resolveTeam,
     teamPath,

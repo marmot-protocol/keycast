@@ -4,7 +4,7 @@
         getCachedProfile,
         npubForPubkey,
         type NostrProfile,
-    } from "$lib/nostr";
+    } from "#lib/nostr";
 
     let {
         pubkey,

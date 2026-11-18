@@ -14,7 +14,7 @@ import {
     DEFAULT_NOSTR_READ_RELAYS,
     DEFAULT_OUTBOX_RELAYS,
     REQUIRED_PUBLIC_RELAYS,
-} from "$lib/utils/relays";
+} from "#lib/utils/relays";
 import { ProfileCache, profileFromEvents } from "./utils/profile_cache";
 import { MANAGEMENT_KIND, MANAGEMENT_READ_KIND } from "./utils/management";
 

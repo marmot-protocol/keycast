@@ -1,8 +1,8 @@
 <script lang="ts">
-    import RelayReliabilityPanel from "$lib/components/RelayReliabilityPanel.svelte";
-    import type { RelayStatus } from "$lib/types";
-    import { formattedUnixDateTime } from "$lib/utils/dates";
-    import { relayHealth } from "$lib/utils/relay_health";
+    import RelayReliabilityPanel from "#lib/components/RelayReliabilityPanel.svelte";
+    import type { RelayStatus } from "#lib/types";
+    import { formattedUnixDateTime } from "#lib/utils/dates";
+    import { relayHealth } from "#lib/utils/relay_health";
     import { CaretDown, CheckCircle, WarningCircle } from "phosphor-svelte";
     let { relay }: { relay: RelayStatus } = $props();
     const health = $derived(relayHealth(relay));

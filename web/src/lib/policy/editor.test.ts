@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import type { PolicyDocument } from "$lib/types";
+import type { PolicyDocument } from "#lib/types";
 import { CRYPTO_METHODS, POLICY_USE_CASES } from "./catalog";
 import { buildDocument, canAddKind, createEditorState, cryptoScope, defaultKinds, disableKindsEverywhere, kindSources, searchUseCases, selectUseCase, setKinds, signingKinds, validateDocument } from "./editor";
 

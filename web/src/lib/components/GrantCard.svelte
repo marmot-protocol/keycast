@@ -1,6 +1,6 @@
 <script lang="ts">
-    import type { Grant } from "$lib/types";
-    import { formattedUnixDateTime } from "$lib/utils/dates";
+    import type { Grant } from "#lib/types";
+    import { formattedUnixDateTime } from "#lib/utils/dates";
     import { LinkSimple } from "phosphor-svelte";
 
     let {

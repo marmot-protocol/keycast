@@ -3,8 +3,8 @@
         getCachedProfile,
         loadProfile,
         type NostrProfile,
-    } from "$lib/nostr";
-    import { safeRemoteImageUrl } from "$lib/utils/image_url";
+    } from "#lib/nostr";
+    import { safeRemoteImageUrl } from "#lib/utils/image_url";
     let {
         pubkey,
         userProfile,

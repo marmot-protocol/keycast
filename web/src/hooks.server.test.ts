@@ -1,7 +1,7 @@
 import { describe, expect, mock, test } from "bun:test";
 import { isProtectedRoute } from "./lib/utils/routes";
 
-mock.module("$lib/utils/routes", () => ({
+mock.module("#lib/utils/routes", () => ({
     isProtectedRoute,
 }));
 

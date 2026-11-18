@@ -1,12 +1,12 @@
 <script lang="ts">
     import { goto } from "$app/navigation";
-    import GrantEditor from "$lib/components/GrantEditor.svelte";
-    import Copy from "$lib/components/Copy.svelte";
-    import PublicKeyDetails from "$lib/components/PublicKeyDetails.svelte";
-    import GrantCard from "$lib/components/GrantCard.svelte";
-    import Loader from "$lib/components/Loader.svelte";
-    import { getCurrentUser } from "$lib/current_user.svelte";
-    import { KeycastApi } from "$lib/keycast_api.svelte";
+    import GrantEditor from "#lib/components/GrantEditor.svelte";
+    import Copy from "#lib/components/Copy.svelte";
+    import PublicKeyDetails from "#lib/components/PublicKeyDetails.svelte";
+    import GrantCard from "#lib/components/GrantCard.svelte";
+    import Loader from "#lib/components/Loader.svelte";
+    import { getCurrentUser } from "#lib/current_user.svelte";
+    import { KeycastApi } from "#lib/keycast_api.svelte";
     import type {
         Grant,
         InvitationCreationResponse,
@@ -14,7 +14,7 @@
         KeyRelayInfo,
         StoredKey,
         Team,
-    } from "$lib/types";
+    } from "#lib/types";
     import { toast } from "svelte-hot-french-toast";
 
     let {
