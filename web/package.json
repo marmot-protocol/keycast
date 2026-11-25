@@ -39,7 +39,7 @@
 		"applesauce-relay": "6.2.1",
 		"applesauce-signers": "6.2.2",
 		"nostr-tools": "2.25.2",
-		"phosphor-svelte": "3.1.0",
+		"phosphor-svelte": "3.1.1",
 		"rxjs": "^7.8.2",
 		"tippy.js": "6.3.7"
 	},
