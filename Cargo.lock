@@ -123,6 +123,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-wsocket"
+version = "0.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f56ae1ca45d338a67c81ce5fa0d8756fedb95d94f2d0bb99b05de12458bb673e"
+dependencies = [
+ "bytes",
+ "futures",
+ "futures-util",
+ "js-sys",
+ "tokio",
+ "tokio-happy-eyeballs",
+ "tokio-rustls",
+ "tokio-tungstenite",
+ "url",
+ "utf8bytes",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+]
+
+[[package]]
 name = "atoi"
 version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1174,7 +1195,7 @@ dependencies = [
 name = "keycast_signer"
 version = "2.0.0-rc.1"
 dependencies = [
- "async-wsocket",
+ "async-wsocket 0.18.0",
  "axum",
  "base64 0.23.1",
  "chrono",
@@ -1358,7 +1379,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6241efa2469244b0c40ad9b32172d07e363a537cb822d3d5ba8c3a78e2829746"
 dependencies = [
  "async-utility",
- "async-wsocket",
+ "async-wsocket 0.17.0",
  "faster-hex",
  "futures",
  "lru",
@@ -2356,6 +2377,15 @@ name = "utf8_iter"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be"
+
+[[package]]
+name = "utf8bytes"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0272f8af8bcfe862654a317db63c318bb677a349b841ab68dd6976d0fe5cb113"
+dependencies = [
+ "bytes",
+]
 
 [[package]]
 name = "valuable"
