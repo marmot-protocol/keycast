@@ -1249,7 +1249,7 @@ async fn audit_control(
 }
 
 pub fn is_operator(actor: &str) -> bool {
-    let Ok(actor_hex) = PublicKey::from_hex(actor.trim()).map(|pk| pk.to_hex()) else {
+    let Some(actor_hex) = super::parse_pubkey_hex_or_npub(actor) else {
         return false;
     };
     std::env::var("KEYCAST_OPERATOR_PUBKEYS")
@@ -1257,6 +1257,7 @@ pub fn is_operator(actor: &str) -> bool {
         .split(',')
         .map(str::trim)
         .filter(|p| !p.is_empty())
+        .filter_map(super::parse_pubkey_hex_or_npub)
         .any(|p| p.eq_ignore_ascii_case(&actor_hex))
 }
 pub fn require_operator(actor: &str) -> ApiResult<()> {

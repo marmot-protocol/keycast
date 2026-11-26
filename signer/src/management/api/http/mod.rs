@@ -467,15 +467,33 @@ fn is_allowed_pubkey(pubkey: &PublicKey) -> bool {
     is_allowed_pubkey_hex(&pubkey.to_hex())
 }
 
+pub(crate) fn parse_pubkey_hex_or_npub(raw: &str) -> Option<String> {
+    use nostr::nips::nip19::FromBech32;
+    let trimmed = raw.trim();
+    if trimmed.len() == 64 && trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return PublicKey::from_hex(trimmed).ok().map(|pk| pk.to_hex());
+    }
+    if trimmed.len() >= 60 && (trimmed.starts_with("npub1") || trimmed.starts_with("NPUB1")) {
+        return PublicKey::from_bech32(trimmed).ok().map(|pk| pk.to_hex());
+    }
+    None
+}
+
+fn normalize_pubkey_entry(raw: &str) -> String {
+    let trimmed = raw.trim();
+    parse_pubkey_hex_or_npub(trimmed).unwrap_or_else(|| trimmed.to_owned())
+}
+
 fn is_allowed_pubkey_hex(pubkey_hex: &str) -> bool {
     let allowed_pubkeys = configured_allowed_pubkeys();
     if allowed_pubkeys.is_empty() {
         return open_registration_enabled();
     }
 
+    let candidate = normalize_pubkey_entry(pubkey_hex);
     allowed_pubkeys
         .iter()
-        .any(|allowed| allowed.eq_ignore_ascii_case(pubkey_hex))
+        .any(|allowed| allowed.eq_ignore_ascii_case(&candidate))
 }
 
 fn open_registration_enabled() -> bool {
@@ -495,7 +513,7 @@ fn parse_allowed_pubkeys(raw_allowlist: &str) -> Vec<String> {
         .split(',')
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
+        .map(normalize_pubkey_entry)
         .collect()
 }
 
@@ -740,6 +758,27 @@ mod tests {
         assert_eq!(configured_allowed_pubkeys(), vec!["abc", "def", "ghi"]);
 
         env::remove_var("ALLOWED_PUBKEYS");
+    }
+
+    #[test]
+    fn npub_and_hex_entries_work_in_allowlist_and_operators() {
+        use nostr::nips::nip19::ToBech32;
+        let _guard = ENV_LOCK.lock().unwrap();
+        let keys = nostr::prelude::Keys::generate();
+        let hex = keys.public_key().to_hex();
+        let npub = keys.public_key().to_bech32().unwrap();
+        env::set_var("ALLOWED_PUBKEYS", format!("abc, {npub}"));
+        env::set_var("KEYCAST_OPERATOR_PUBKEYS", &npub);
+
+        assert!(is_allowed_pubkey_hex(&hex));
+        assert!(is_allowed_pubkey_hex(&npub));
+        assert!(teams::is_operator(&hex));
+        assert!(teams::is_operator(&npub));
+        assert!(!teams::is_operator(""));
+
+        env::remove_var("ALLOWED_PUBKEYS");
+        env::remove_var("KEYCAST_OPERATOR_PUBKEYS");
+        assert!(!teams::is_operator(""));
     }
 
     #[test]
