@@ -211,6 +211,17 @@ impl Store {
 }
 
 pub async fn poll(store: &Store) -> Result<bool, StoreError> {
+    poll_with_fetcher(store, |seed, author| async move {
+        fetch_list(&seed, author).await
+    })
+    .await
+}
+
+async fn poll_with_fetcher<F, Fut>(store: &Store, mut fetch: F) -> Result<bool, StoreError>
+where
+    F: FnMut(String, PublicKey) -> Fut,
+    Fut: std::future::Future<Output = Option<Event>>,
+{
     // Retire removed hints after a 24-hour client migration overlap.
     let retired = query("DELETE FROM key_relays WHERE retire_at<=unixepoch()")
         .execute(&store.pool)
@@ -223,14 +234,6 @@ pub async fn poll(store: &Store) -> Result<bool, StoreError> {
         .rows_affected()
         > 0;
     let mut changed = retired || removed;
-
-    let automatic: bool =
-        query_scalar("SELECT auto_activate FROM relay_discovery_policy WHERE singleton=1")
-            .fetch_one(&store.pool)
-            .await?;
-    if !automatic {
-        return Ok(changed);
-    }
 
     let row:Option<(i64,String)>=query_as("SELECT k.id,k.public_key FROM stored_keys k JOIN key_relay_lists d ON d.stored_key_id=k.id WHERE d.next_fetch_at<=unixepoch() ORDER BY d.next_fetch_at,k.id LIMIT 1").fetch_optional(&store.pool).await?;
     let Some((id, public)) = row else {
@@ -247,8 +250,10 @@ pub async fn poll(store: &Store) -> Result<bool, StoreError> {
     for seed in
         std::iter::once("wss://purplepag.es").chain(seeds.iter().take(2).map(String::as_str))
     {
-        if let Some(event) = fetch_list(seed, author).await {
-            if best.as_ref().is_none_or(|old| newer(&event, old)) {
+        if let Some(event) = fetch(seed.to_owned(), author).await {
+            if parse(&event, author, Timestamp::now().as_secs()).is_some()
+                && best.as_ref().is_none_or(|old| newer(&event, old))
+            {
                 best = Some(event);
             }
         }
@@ -349,5 +354,85 @@ mod tests {
         )
         .is_none());
         assert!(parse(&e, keys.public_key(), 0).is_none());
+    }
+
+    #[tokio::test]
+    async fn poll_caches_nip65_list_when_auto_activate_is_disabled_without_activating_routes() {
+        let pool = sqlx_sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query::query("PRAGMA foreign_keys=ON")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::raw_sql::raw_sql(concat!(
+            include_str!("../../database/migrations/0001_initial.sql"),
+            "\n",
+            include_str!("../../database/migrations/0004_key_relay_discovery.sql")
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let store = Store::new(
+            pool.clone(),
+            keycast_core::v2::envelope::EnvelopeCipher::from_key(zeroize::Zeroizing::new([3; 32])),
+        );
+        let team_id: i64 = query_scalar("INSERT INTO teams(name) VALUES('ops') RETURNING id")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let admin = Keys::generate();
+        let imported = Keys::generate();
+        let stored_key = store
+            .seal_stored_key(
+                team_id,
+                &admin.public_key().to_hex(),
+                "Imported".into(),
+                zeroize::Zeroizing::new(imported.secret_key().to_secret_hex()),
+            )
+            .await
+            .unwrap();
+        let auto_activate: bool =
+            query_scalar("SELECT auto_activate FROM relay_discovery_policy WHERE singleton=1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(!auto_activate, "auto_activate must default to false");
+
+        let nip65 = EventBuilder::new(Kind::RelayList, "")
+            .tags([
+                Tag::parse(["r", "wss://discovered.example", "write"]).unwrap(),
+                Tag::parse(["r", "wss://read-only.example", "read"]).unwrap(),
+            ])
+            .finalize(&imported)
+            .unwrap();
+        let nip65_id = nip65.id.to_hex();
+
+        let changed = poll_with_fetcher(&store, move |_seed, author| {
+            let event = (author == imported.public_key()).then(|| nip65.clone());
+            async move { event }
+        })
+        .await
+        .unwrap();
+        assert!(
+            !changed,
+            "caching NIP-65 hints with auto_activate=false must not activate routes"
+        );
+
+        let info = store.key_relay_info(stored_key.id).await.unwrap();
+        assert_eq!(info.status, "cached");
+        assert_eq!(info.event_id.as_deref(), Some(nip65_id.as_str()));
+        assert!(info.fetched_at.is_some());
+        assert!(!info.auto_activate);
+        assert_eq!(info.relays.len(), 2);
+        assert!(info.relays.iter().all(|r| !r.active && r.listed));
+
+        let discovered_rows: i64 = query_scalar("SELECT count(*) FROM relays WHERE discovered=1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(discovered_rows, 0);
     }
 }
