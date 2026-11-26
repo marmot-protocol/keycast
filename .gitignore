@@ -2,6 +2,7 @@
 /target
 /node_modules
 /runtime
+/state
 master.key
 *.db
 *.db-shm

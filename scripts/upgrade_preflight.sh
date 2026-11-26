@@ -45,11 +45,11 @@ env_value() {
 ALLOWED_PUBKEYS="${ALLOWED_PUBKEYS:-$(env_value ALLOWED_PUBKEYS)}"
 DOMAIN="${DOMAIN:-$(env_value DOMAIN)}"
 KEYCAST_OPERATOR_PUBKEYS="${KEYCAST_OPERATOR_PUBKEYS:-$(env_value KEYCAST_OPERATOR_PUBKEYS)}"
-# Must resolve exactly like ${KEYCAST_STATE_DIR:-.} in the Compose files, or this
+# Must resolve exactly like ${KEYCAST_STATE_DIR:-./state} in the Compose files, or this
 # would check and repair a stale copy while the containers mount another one.
 KEYCAST_STATE_DIR="${KEYCAST_STATE_DIR:-$(env_value KEYCAST_STATE_DIR)}"
 if [[ -z "$KEYCAST_STATE_DIR" ]]; then
-    STATE_DIR="$ROOT_DIR"
+    STATE_DIR="$ROOT_DIR/state"
 elif [[ "$KEYCAST_STATE_DIR" = /* ]]; then
     STATE_DIR="$KEYCAST_STATE_DIR"
 else

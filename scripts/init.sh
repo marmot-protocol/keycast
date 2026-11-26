@@ -12,7 +12,7 @@ STATE_DIR_ARG=""
 
 usage() {
     echo "Usage: $0 --domain <domain> --allowed-pubkeys <hex|npub[,...]> [--operator-pubkeys <hex|npub[,...]>] [--state-dir <path>]"
-    echo "  --state-dir  Where the database and root credential live. Defaults to this checkout."
+    echo "  --state-dir  Where the database and root credential live. Defaults to ./state."
 }
 
 require_value() {
@@ -63,9 +63,9 @@ if [[ -e .env || -L .env ]]; then
     echo "Error: .env already exists; refusing to overwrite it"
     exit 1
 fi
-# Must match ${KEYCAST_STATE_DIR:-.} in the Compose files.
+# Must match ${KEYCAST_STATE_DIR:-./state} in the Compose files.
 if [[ -z "$STATE_DIR_ARG" ]]; then
-    STATE_DIR="$ROOT_DIR"
+    STATE_DIR="$ROOT_DIR/state"
 elif [[ "$STATE_DIR_ARG" = /* ]]; then
     STATE_DIR="$STATE_DIR_ARG"
 else
@@ -95,7 +95,7 @@ fi
 
 {
     echo "DOMAIN=$DOMAIN"
-    if [[ "$STATE_DIR" != "$ROOT_DIR" ]]; then
+    if [[ "$STATE_DIR" != "$ROOT_DIR/state" ]]; then
         echo "KEYCAST_STATE_DIR=$STATE_DIR"
     fi
     echo "ALLOWED_PUBKEYS=$ALLOWED_PUBKEYS"

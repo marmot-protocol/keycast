@@ -23,7 +23,7 @@ WORKDIR /app
 ENV CI=true NODE_ENV=production VITE_BUILD_MODE=production
 ARG VITE_DOMAIN
 ENV VITE_DOMAIN=${VITE_DOMAIN}
-COPY web/package.json web/bun.lockb ./
+COPY web/package.json web/bun.lockb web/bunfig.toml ./
 RUN --mount=type=cache,target=/root/.bun/install/cache bun install --frozen-lockfile
 COPY web ./
 RUN bun run check && bun run build
@@ -44,24 +44,25 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 RUN groupadd --system --gid 10001 keycast \
     && useradd --system --uid 10001 --gid keycast --home-dir /nonexistent --shell /usr/sbin/nologin keycast \
-    && install -d -o keycast -g keycast -m 0700 /app/database \
     && install -d -o keycast -g keycast -m 0750 /run/keycast
-COPY --chown=root:root database/migrations /app/migrations
 WORKDIR /app
-ENV KEYCAST_DATABASE_PATH=/app/database/keycast-v2.db \
-    KEYCAST_MIGRATIONS_PATH=/app/migrations \
-    KEYCAST_SIGNER_SOCKET=/run/keycast/signer.sock
-USER keycast:keycast
+ENV KEYCAST_SIGNER_SOCKET=/run/keycast/signer.sock
 
 FROM rust-runtime-base AS api-runtime
 COPY --chown=root:root --chmod=0555 --from=rust-builder /out/keycast_api /app/keycast_api
+USER keycast:keycast
 EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=6s --start-period=10s --retries=3 CMD ["/app/keycast_api", "healthcheck"]
 ENTRYPOINT ["/app/keycast_api"]
 
 FROM rust-runtime-base AS signer-runtime
+RUN install -d -o keycast -g keycast -m 0700 /app/database
+COPY --chown=root:root database/migrations /app/migrations
 COPY --chown=root:root --chmod=0555 --from=rust-builder /out/keycast_signer /app/keycast_signer
-ENV KEYCAST_ROOT_KEY_FILE=/run/secrets/keycast-root-key
+ENV KEYCAST_DATABASE_PATH=/app/database/keycast-v2.db \
+    KEYCAST_MIGRATIONS_PATH=/app/migrations \
+    KEYCAST_ROOT_KEY_FILE=/run/secrets/keycast-root-key
+USER keycast:keycast
 HEALTHCHECK --interval=30s --timeout=6s --start-period=10s --retries=3 CMD ["/app/keycast_signer", "healthcheck"]
 ENTRYPOINT ["/app/keycast_signer"]
 

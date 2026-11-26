@@ -9,6 +9,9 @@ on:
   push:
     branches:
       - master
+  schedule:
+    # Weekly dependency advisory audit even when no PRs are opened.
+    - cron: '0 6 * * 1'
 
 permissions:
   contents: read
@@ -49,7 +52,7 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Check Rust workspace
-        run: cargo check --workspace --locked
+        run: cargo check --workspace --all-targets --locked
 
       - name: Check the core crate builds and tests standalone
         run: cargo test -p keycast_core --locked --no-run

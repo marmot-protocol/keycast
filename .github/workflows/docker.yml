@@ -24,7 +24,41 @@ env:
 
 jobs:
   build:
-    name: Build and verify Linux AMD64 candidate images
+    name: Build and smoke test Linux AMD64 candidate images
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check product version
+        id: version
+        run: echo "version=$(python3 scripts/releases/release.py check-version)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      # Gate the code before anything is pushed, including on a branch dispatch
+      # where no publication happens at all.
+      - name: Build all runtime targets locally
+        run: |
+          set -euo pipefail
+          docker buildx build --platform linux/amd64 --build-arg KEYCAST_VERSION=${{ steps.version.outputs.version }} --build-arg KEYCAST_BUILD_REVISION="$GITHUB_SHA" --load --target api-runtime --tag keycast-hardening-api:local .
+          docker buildx build --platform linux/amd64 --build-arg KEYCAST_VERSION=${{ steps.version.outputs.version }} --build-arg KEYCAST_BUILD_REVISION="$GITHUB_SHA" --load --target signer-runtime --tag keycast-hardening-signer:local .
+          docker buildx build --platform linux/amd64 --build-arg KEYCAST_VERSION=${{ steps.version.outputs.version }} --build-arg KEYCAST_BUILD_REVISION="$GITHUB_SHA" --load --target web-runtime --tag keycast-hardening-web:local .
+
+      - name: Smoke test the local build
+        run: scripts/container-smoke.sh
+
+  publish:
+    name: Publish and attest Linux AMD64 candidate images
+    needs: build
+    if: github.ref == 'refs/heads/master' && github.event_name == 'push'
     runs-on: ubuntu-latest
 
     permissions:
@@ -46,7 +80,6 @@ jobs:
         run: echo "version=$(python3 scripts/releases/release.py check-version)" >> "$GITHUB_OUTPUT"
 
       - name: Require the complete CI workflow for this commit
-        if: github.ref == 'refs/heads/master'
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 scripts/releases/release.py wait-ci --sha "$GITHUB_SHA"
@@ -54,20 +87,7 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
-      # Gate the code before anything is pushed, including on a branch dispatch
-      # where no publication happens at all.
-      - name: Build all runtime targets locally
-        run: |
-          set -euo pipefail
-          docker buildx build --platform linux/amd64 --build-arg KEYCAST_VERSION=${{ steps.version.outputs.version }} --build-arg KEYCAST_BUILD_REVISION="$GITHUB_SHA" --load --target api-runtime --tag keycast-hardening-api:local .
-          docker buildx build --platform linux/amd64 --build-arg KEYCAST_VERSION=${{ steps.version.outputs.version }} --build-arg KEYCAST_BUILD_REVISION="$GITHUB_SHA" --load --target signer-runtime --tag keycast-hardening-signer:local .
-          docker buildx build --platform linux/amd64 --build-arg KEYCAST_VERSION=${{ steps.version.outputs.version }} --build-arg KEYCAST_BUILD_REVISION="$GITHUB_SHA" --load --target web-runtime --tag keycast-hardening-web:local .
-
-      - name: Smoke test the local build
-        run: scripts/container-smoke.sh
-
       - name: Log in to GitHub Container Registry
-        if: github.ref == 'refs/heads/master'
         uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ${{ env.REGISTRY }}
@@ -75,13 +95,11 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Compute the unique candidate tag
-        if: github.ref == 'refs/heads/master'
         id: tags
         run: echo "candidate=sha-${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
 
       # Unique per workflow attempt; record and test the pushed digests.
       - name: Push API image to its candidate tag
-        if: github.ref == 'refs/heads/master'
         id: api
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
@@ -97,7 +115,6 @@ jobs:
           tags: ${{ env.API_IMAGE }}:${{ steps.tags.outputs.candidate }}
 
       - name: Push signer image to its candidate tag
-        if: github.ref == 'refs/heads/master'
         id: signer
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
@@ -113,7 +130,6 @@ jobs:
           tags: ${{ env.SIGNER_IMAGE }}:${{ steps.tags.outputs.candidate }}
 
       - name: Push web image to its candidate tag
-        if: github.ref == 'refs/heads/master'
         id: web
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
@@ -130,10 +146,8 @@ jobs:
 
       # Smoke the exact published artefacts, not a second local build.
       - name: Smoke test the published digests
-        if: github.ref == 'refs/heads/master'
         run: |
           set -euo pipefail
-          docker image rm -f keycast-hardening-api:local keycast-hardening-signer:local keycast-hardening-web:local
           docker pull "${API_IMAGE}@${{ steps.api.outputs.digest }}"
           docker pull "${SIGNER_IMAGE}@${{ steps.signer.outputs.digest }}"
           docker pull "${WEB_IMAGE}@${{ steps.web.outputs.digest }}"
@@ -143,7 +157,6 @@ jobs:
           scripts/container-smoke.sh
 
       - name: Attest API build provenance
-        if: github.ref == 'refs/heads/master'
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ${{ env.API_IMAGE }}
@@ -151,7 +164,6 @@ jobs:
           push-to-registry: true
 
       - name: Attest signer build provenance
-        if: github.ref == 'refs/heads/master'
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ${{ env.SIGNER_IMAGE }}
@@ -159,7 +171,6 @@ jobs:
           push-to-registry: true
 
       - name: Attest web build provenance
-        if: github.ref == 'refs/heads/master'
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ${{ env.WEB_IMAGE }}
@@ -167,7 +178,6 @@ jobs:
           push-to-registry: true
 
       - name: Assemble the verified candidate bundle
-        if: github.ref == 'refs/heads/master'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -177,7 +187,6 @@ jobs:
             --web '${{ steps.web.outputs.digest }}'
 
       - name: Preserve candidate for explicit release
-        if: github.ref == 'refs/heads/master'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.0
         with:
           name: release-candidate
@@ -187,7 +196,6 @@ jobs:
 
       # The digests an operator copies into .env, with the verify command.
       - name: Report digests for pinning
-        if: github.ref == 'refs/heads/master'
         run: |
           {
             echo "## Smoke-tested digests for .env"
@@ -205,7 +213,7 @@ jobs:
               "${API_IMAGE}@${{ steps.api.outputs.digest }}" \
               "${SIGNER_IMAGE}@${{ steps.signer.outputs.digest }}" \
               "${WEB_IMAGE}@${{ steps.web.outputs.digest }}"; do
-              echo "gh attestation verify oci://$pair --repo ${{ github.repository }}"
+              echo "gh attestation verify oci://$pair --repo ${{ github.repository }} --source-ref refs/heads/master --signer-workflow ${{ github.repository }}/.github/workflows/docker.yml --deny-self-hosted-runners"
             done
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"

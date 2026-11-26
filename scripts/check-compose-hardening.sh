@@ -33,7 +33,7 @@ ok "all Compose files render"
 for file in "${APPLICATION_COMPOSE_FILES[@]}"; do
     if docker compose -f "$file" config --format json |
         python3 -c '
-import json, sys
+import json, os, sys
 
 config = json.load(sys.stdin)
 services = config.get("services", {})
@@ -74,6 +74,12 @@ signer_nets = set((services.get("keycast-signer") or {}).get("networks") or [])
 if signer_nets != {"keycast-signer-egress"}:
     errors.append(f"keycast-signer networks must be only keycast-signer-egress, got {sorted(signer_nets)}")
 
+for vol in (services.get("keycast-signer") or {}).get("volumes") or []:
+    if isinstance(vol, dict) and vol.get("target") == "/app/database":
+        src = str(vol.get("source", "")).rstrip("/")
+        if src.endswith("/database") and not src.endswith("/state/database") and src == os.path.join(os.getcwd(), "database"):
+            errors.append(f"keycast-signer default database mount must not bind tracked checkout database/: {src}")
+
 for isolated in ("keycast-api", "keycast-web"):
     svc = services.get(isolated) or {}
     nets = set(svc.get("networks") or [])
@@ -98,7 +104,7 @@ done
 for file in "${COMPOSE_FILES[@]}"; do
     if docker compose -f "$file" config --format json |
         python3 -c '
-import json, sys
+import json, os, sys
 
 config = json.load(sys.stdin)
 errors = []
@@ -113,12 +119,16 @@ for name, service in config.get("services", {}).items():
     if name == "caddy":
         if service.get("read_only") is not True:
             errors.append("caddy: read_only must be true")
+        if service.get("user") != "10001:10001":
+            errors.append("caddy: user must be 10001:10001")
         mem = service.get("mem_limit")
         swap = service.get("memswap_limit")
         if not mem or swap != mem:
             errors.append("caddy: memswap_limit must equal mem_limit")
         if service.get("cap_drop") != ["ALL"]:
             errors.append("caddy: cap_drop must be [\"ALL\"]")
+        if service.get("cap_add"):
+            errors.append("caddy: must not add capabilities")
         if "no-new-privileges:true" not in (service.get("security_opt") or []):
             errors.append("caddy: missing no-new-privileges:true")
 if errors:
