@@ -366,6 +366,7 @@ impl RequestProcessor {
             Err(error) => return Err(error.into()),
         }
 
+        let current_session_id = current_session.as_ref().map(|session| session.id);
         let execution = self
             .execute(
                 &grant,
@@ -385,7 +386,7 @@ impl RequestProcessor {
                     error = %error,
                     "NIP-46 request failed safely"
                 );
-                Execution::denied("request failed", "operation_failed", None)
+                Execution::denied("request failed", "operation_failed", current_session_id)
             }
         };
 
@@ -802,14 +803,13 @@ impl RequestProcessor {
     }
 }
 
-pub(crate) fn validate_outer_event(event: &Event) -> Result<(), ProtocolError> {
+pub(crate) fn validate_outer_bounds(event: &Event) -> Result<(), ProtocolError> {
     if event.kind != Kind::NostrConnect
         || event.content.len() > MAX_EVENT_CONTENT_BYTES
         || event.as_json().len() > MAX_EVENT_CONTENT_BYTES + 4096
     {
         return Err(ProtocolError::EventTooLarge);
     }
-    event.verify().map_err(|_| ProtocolError::InvalidEvent)?;
     let now = Timestamp::now().as_secs();
     let created_at = event.created_at.as_secs();
     if created_at.saturating_add(MAX_REQUEST_AGE_SECONDS) < now
@@ -817,6 +817,12 @@ pub(crate) fn validate_outer_event(event: &Event) -> Result<(), ProtocolError> {
     {
         return Err(ProtocolError::InvalidEvent);
     }
+    Ok(())
+}
+
+pub(crate) fn validate_outer_event(event: &Event) -> Result<(), ProtocolError> {
+    validate_outer_bounds(event)?;
+    event.verify().map_err(|_| ProtocolError::InvalidEvent)?;
     Ok(())
 }
 

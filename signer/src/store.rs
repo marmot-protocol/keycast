@@ -480,7 +480,7 @@ impl Store {
             "INSERT INTO relay_checkpoints(
                 relay_id, last_event_created_at, last_event_id, last_received_at,
                 consecutive_failures, last_error
-             ) SELECT id, ?, ?, unixepoch(), 0, NULL FROM relays WHERE url = ?
+             ) SELECT id, ?, ?, unixepoch(), 0, NULL FROM relays WHERE rtrim(url, '/') = rtrim(?, '/')
              ON CONFLICT(relay_id) DO UPDATE SET
                 last_event_created_at = excluded.last_event_created_at,
                 last_event_id = excluded.last_event_id,
@@ -499,7 +499,7 @@ impl Store {
         query(
             "INSERT INTO relay_checkpoints(
                 relay_id, last_published_at, consecutive_failures, last_error
-             ) SELECT id, unixepoch(), 0, NULL FROM relays WHERE url = ?
+             ) SELECT id, unixepoch(), 0, NULL FROM relays WHERE rtrim(url, '/') = rtrim(?, '/')
              ON CONFLICT(relay_id) DO UPDATE SET
                 last_published_at = unixepoch(), consecutive_failures = 0,
                 last_error = NULL, updated_at = unixepoch()",
@@ -869,7 +869,8 @@ impl Store {
         let mut tx = self.pool.begin().await?;
         query(
             "UPDATE processed_requests SET session_id = ?, status = ?, reason_code = ?,
-                    response_event_json = ?, reserved_response_bytes=0, completed_at = unixepoch()
+                    request_event_json = NULL, response_event_json = ?, reserved_response_bytes=0,
+                    completed_at = max(unixepoch(), received_at)
              WHERE event_id = ?",
         )
         .bind(session_id)
