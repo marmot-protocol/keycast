@@ -14,6 +14,8 @@ pub enum ApiError {
     Database(#[from] sqlx::Error),
     #[error("invalid input: {0}")]
     BadRequest(String),
+    #[error("{0}")]
+    Conflict(String),
     #[error("permission denied")]
     Forbidden,
     #[error("resource not found")]
@@ -28,6 +30,21 @@ impl ApiError {
     pub fn bad_request(message: impl Into<String>) -> Self {
         Self::BadRequest(message.into())
     }
+
+    pub fn conflict(message: impl Into<String>) -> Self {
+        Self::Conflict(message.into())
+    }
+
+    pub fn from_database_conflict(error: sqlx::Error, message: impl Into<String>) -> Self {
+        if error
+            .as_database_error()
+            .is_some_and(|db| db.is_unique_violation())
+        {
+            Self::Conflict(message.into())
+        } else {
+            Self::Database(error)
+        }
+    }
 }
 
 impl From<SignerClientError> for ApiError {
@@ -38,6 +55,9 @@ impl From<SignerClientError> for ApiError {
                 if code == "invalid_input" || code == "not_claimable" =>
             {
                 Self::BadRequest("signer rejected the request".to_string())
+            }
+            SignerClientError::Rejected { code, message } if code == "conflict" => {
+                Self::Conflict(message)
             }
             SignerClientError::Rejected { code, .. } if code == "not_found" => Self::NotFound,
             SignerClientError::InvalidResponse | SignerClientError::Rejected { .. } => {
@@ -55,6 +75,7 @@ impl IntoResponse for ApiError {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
+            Self::Conflict(_) => StatusCode::CONFLICT,
             Self::Forbidden => StatusCode::FORBIDDEN,
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::SignerUnavailable => StatusCode::SERVICE_UNAVAILABLE,

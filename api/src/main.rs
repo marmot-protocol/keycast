@@ -94,10 +94,31 @@ async fn api_healthcheck() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn readiness(state: &KeycastState) -> StatusCode {
-    match state.signer.request(&ControlRequest::Status).await {
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+    static READY_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+    static READY_CACHE: OnceLock<Mutex<Option<(Instant, StatusCode)>>> = OnceLock::new();
+    let cache = READY_CACHE.get_or_init(|| Mutex::new(None));
+    let now = Instant::now();
+    if let Some((at, status)) = *cache.lock().unwrap_or_else(|e| e.into_inner()) {
+        if now.saturating_duration_since(at) < Duration::from_secs(1) {
+            return status;
+        }
+    }
+    let Ok(_permit) = READY_PERMITS.try_acquire() else {
+        if let Some((at, status)) = *cache.lock().unwrap_or_else(|e| e.into_inner()) {
+            if now.saturating_duration_since(at) < Duration::from_secs(5) {
+                return status;
+            }
+        }
+        return StatusCode::SERVICE_UNAVAILABLE;
+    };
+    let status = match state.signer.request(&ControlRequest::Status).await {
         Ok(ControlResponse::Status { status }) if status.ready => StatusCode::OK,
         _ => StatusCode::SERVICE_UNAVAILABLE,
-    }
+    };
+    *cache.lock().unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), status));
+    status
 }
 
 fn cors_layer() -> Result<Option<CorsLayer>, Box<dyn std::error::Error>> {

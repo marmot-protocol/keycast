@@ -155,7 +155,8 @@ pub async fn add_user(
         .bind(&user_public_key)
         .bind(request.role.as_str())
         .execute(&mut *transaction)
-        .await?;
+        .await
+        .map_err(|e| ApiError::from_database_conflict(e, "user is already a team member"))?;
     audit_control(
         &mut transaction,
         id,
@@ -565,7 +566,10 @@ pub async fn add_policy(
             .bind(request.name.trim())
             .bind(document)
             .fetch_one(&mut *transaction)
-            .await?;
+            .await
+            .map_err(|e| {
+                ApiError::from_database_conflict(e, "a policy with this name already exists")
+            })?;
     audit_control(&mut transaction, id, &actor, "policy.create", "succeeded").await?;
     transaction.commit().await?;
     Ok((
@@ -599,7 +603,8 @@ pub async fn update_policy(
     .bind(policy_id)
     .bind(id)
     .execute(&mut *transaction)
-    .await?;
+    .await
+    .map_err(|e| ApiError::from_database_conflict(e, "a policy with this name already exists"))?;
     if result.rows_affected() == 0 {
         return Err(ApiError::NotFound);
     }
@@ -886,9 +891,16 @@ pub async fn update_relays(
     let mut normalized = Vec::with_capacity(request.relays.len());
     let mut unique = std::collections::BTreeSet::new();
     for relay in request.relays {
-        let parsed = nostr::types::RelayUrl::parse(relay.url.trim())
+        let trimmed = relay.url.trim();
+        if trimmed.len() > 512 {
+            return Err(ApiError::bad_request("relay URL exceeds maximum length"));
+        }
+        let parsed = nostr::types::RelayUrl::parse(trimmed)
             .map_err(|_| ApiError::bad_request("invalid relay URL"))?;
         let url = parsed.to_string();
+        if url.len() > 512 {
+            return Err(ApiError::bad_request("relay URL exceeds maximum length"));
+        }
         let parsed_url =
             url::Url::parse(&url).map_err(|_| ApiError::bad_request("invalid relay URL"))?;
         let is_secure = parsed_url.scheme() == "wss";
@@ -926,9 +938,31 @@ pub async fn update_relays(
     let urls = serde_json::to_string(&normalized.iter().map(|(url, _)| url).collect::<Vec<_>>())
         .map_err(|_| ApiError::Internal)?;
     query("DELETE FROM relays WHERE discovered=0 AND url NOT IN (SELECT value FROM json_each(?))")
-        .bind(urls)
+        .bind(&urls)
         .execute(&mut *transaction)
         .await?;
+    // Evict excess discovered relays so upserting up to 20 manual relays never trips the 20-relay table limit.
+    let remaining_discovered: i64 = query_scalar(
+        "SELECT count(*) FROM relays WHERE discovered=1 AND url NOT IN (SELECT value FROM json_each(?))",
+    )
+    .bind(&urls)
+    .fetch_one(&mut *transaction)
+    .await?;
+    let excess = (normalized.len() as i64 + remaining_discovered).saturating_sub(20);
+    if excess > 0 {
+        query(
+            "DELETE FROM relays WHERE id IN (
+                SELECT id FROM relays
+                WHERE discovered=1 AND url NOT IN (SELECT value FROM json_each(?))
+                ORDER BY sort_order DESC, id DESC
+                LIMIT ?
+             )",
+        )
+        .bind(&urls)
+        .bind(excess)
+        .execute(&mut *transaction)
+        .await?;
+    }
     for (index, (url, enabled)) in normalized.into_iter().enumerate() {
         query(
             "INSERT INTO relays(url, enabled, sort_order) VALUES (?, ?, ?)

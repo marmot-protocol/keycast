@@ -256,10 +256,8 @@ pub async fn public_config(
 }
 
 fn response_with_status(status: StatusCode, message: &'static str) -> Response {
-    Response::builder()
-        .status(status)
-        .body(message.into())
-        .unwrap()
+    use axum::response::IntoResponse;
+    (status, Json(serde_json::json!({ "error": message }))).into_response()
 }
 
 fn validate_token(
@@ -325,13 +323,6 @@ pub fn validate_auth_event(
     body: &[u8],
     public_url: &str,
 ) -> Result<(), AuthenticationError> {
-    if event.verify().is_err() {
-        tracing::debug!("Token validation failed: Event verification failed");
-        return Err(AuthenticationError::InvalidEvent(
-            "Event verification failed".to_string(),
-        ));
-    }
-
     let write = !matches!(
         *request.method(),
         axum::http::Method::GET | axum::http::Method::HEAD
@@ -390,6 +381,13 @@ pub fn validate_auth_event(
     }
 
     validate_payload_tag(event, body)?;
+
+    if event.verify().is_err() {
+        tracing::debug!("Token validation failed: Event verification failed");
+        return Err(AuthenticationError::InvalidEvent(
+            "Event verification failed".to_string(),
+        ));
+    }
 
     Ok(())
 }

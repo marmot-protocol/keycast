@@ -5,6 +5,7 @@ use keycast_core::v2::control::{ControlRequest, ControlResponse};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
+use zeroize::Zeroizing;
 
 const MAX_CONTROL_RESPONSE_BYTES: u64 = keycast_core::v2::management::MAX_CONTROL_BYTES;
 
@@ -41,8 +42,9 @@ impl SignerClient {
             let mut stream = UnixStream::connect(&self.socket_path)
                 .await
                 .map_err(|_| SignerClientError::Unavailable)?;
-            let bytes =
-                serde_json::to_vec(request).map_err(|_| SignerClientError::InvalidResponse)?;
+            let bytes = Zeroizing::new(
+                serde_json::to_vec(request).map_err(|_| SignerClientError::InvalidResponse)?,
+            );
             stream
                 .write_all(&bytes)
                 .await
@@ -51,7 +53,7 @@ impl SignerClient {
                 .shutdown()
                 .await
                 .map_err(|_| SignerClientError::Unavailable)?;
-            let mut response = Vec::new();
+            let mut response = Zeroizing::new(Vec::new());
             (&mut stream)
                 .take(MAX_CONTROL_RESPONSE_BYTES + 1)
                 .read_to_end(&mut response)
