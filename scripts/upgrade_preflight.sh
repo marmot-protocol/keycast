@@ -3,15 +3,17 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FIX_PERMISSIONS=false
+SKIP_PROVENANCE=false
 
 usage() {
-    echo "Usage: $0 [--fix-permissions]"
+    echo "Usage: $0 [--fix-permissions] [--skip-provenance]"
     echo "Validates a clean Keycast v2 deployment. Legacy database contents are not migrated."
 }
 
 while [[ "$#" -gt 0 ]]; do
     case "$1" in
         --fix-permissions) FIX_PERMISSIONS=true ;;
+        --skip-provenance) SKIP_PROVENANCE=true ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Unknown argument: $1"; usage; exit 1 ;;
     esac
@@ -21,7 +23,22 @@ done
 env_value() {
     local key="$1"
     if [[ -f "$ROOT_DIR/.env" ]]; then
-        awk -F= -v key="$key" '$1 == key {sub(/^[^=]*=/, ""); print; exit}' "$ROOT_DIR/.env"
+        awk -F= -v key="$key" '
+            /^[[:space:]]*#/ { next }
+            {
+                sub(/\r$/, "")
+                if ($1 == key) {
+                    val = substr($0, index($0, "=") + 1)
+                    if ((substr(val, 1, 1) == "\"" && substr(val, length(val), 1) == "\"") ||
+                        (substr(val, 1, 1) == "\x27" && substr(val, length(val), 1) == "\x27")) {
+                        val = substr(val, 2, length(val) - 2)
+                    }
+                    found = val
+                    has_found = 1
+                }
+            }
+            END { if (has_found) print found }
+        ' "$ROOT_DIR/.env"
     fi
 }
 
@@ -53,18 +70,21 @@ if [[ -n "$DOMAIN" && ! "$DOMAIN" =~ [^A-Za-z0-9.-] ]]; then
 else
     fail "DOMAIN is missing or is not a hostname"
 fi
+PUBKEY_RE='([0-9a-fA-F]{64}|(npub1|NPUB1)[qpzry9x8gf2tvdw0s3jn54khce6mua7lQPZRY9X8GF2TVDW0S3JN54KHCE6MUA7L]{58})'
 for pubkey_name in ALLOWED_PUBKEYS KEYCAST_OPERATOR_PUBKEYS; do
-    if [[ "${!pubkey_name}" =~ ^[0-9a-fA-F]{64}(,[0-9a-fA-F]{64})*$ ]]; then
-        ok "$pubkey_name contains valid hex pubkeys"
+    if [[ "${!pubkey_name}" =~ ^${PUBKEY_RE}(,${PUBKEY_RE})*$ ]]; then
+        ok "$pubkey_name contains valid hex/npub pubkeys"
     else
-        fail "$pubkey_name must contain comma-separated 64-character hex pubkeys without whitespace or empty fields"
+        fail "$pubkey_name must contain comma-separated 64-character hex or npub1 pubkeys without whitespace or empty fields"
     fi
 done
 
 if [[ "$STATE_DIR" != "$ROOT_DIR" ]]; then
     ok "state directory is $STATE_DIR"
 fi
-if [[ -f "$ROOT_KEY" ]]; then
+if [[ -L "$ROOT_KEY" ]]; then
+    fail "$ROOT_KEY must be a regular file, not a symlink"
+elif [[ -f "$ROOT_KEY" ]]; then
     key_value="$(tr -d '\r\n' < "$ROOT_KEY")"
     if [[ "$key_value" =~ ^[0-9a-fA-F]{64}$ || "$key_value" =~ ^[A-Za-z0-9+/]{43}=$ ]]; then
         ok "master.key encodes exactly 32 bytes"
@@ -75,7 +95,9 @@ else
     fail "$ROOT_KEY is missing"
 fi
 
-if [[ -d "$DATABASE_DIR" ]]; then
+if [[ -L "$DATABASE_DIR" ]]; then
+    fail "$DATABASE_DIR must be a directory, not a symlink"
+elif [[ -d "$DATABASE_DIR" ]]; then
     ok "database directory exists"
 else
     fail "$DATABASE_DIR is missing"
@@ -91,6 +113,9 @@ fi
 # filesystem status to stdout before failing and corrupt the captured value.
 file_owner() {
     stat -c '%u' "$1" 2>/dev/null || stat -f '%u' "$1" 2>/dev/null || true
+}
+file_mode() {
+    stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null || true
 }
 if [[ -f "$DATABASE_DIR/keycast-v2.db" ]] && command -v sqlite3 >/dev/null 2>&1; then
     # `-readonly` is the read-only guarantee. A `file:` URI would be read as a
@@ -119,7 +144,9 @@ fi
 
 # Require both paths: without the directory guard, chmod fails under `set -e`
 # and the script exits before printing the collected failure summary.
-if [[ "$FIX_PERMISSIONS" == true && -f "$ROOT_KEY" && -d "$DATABASE_DIR" ]]; then
+if [[ -d "$DATABASE_DIR/migrations" ]]; then
+    fail "$DATABASE_DIR contains tracked migrations/; set KEYCAST_STATE_DIR to a separate state directory (e.g. ./state or /srv/keycast)"
+elif [[ "$FIX_PERMISSIONS" == true && -f "$ROOT_KEY" && ! -L "$ROOT_KEY" && -d "$DATABASE_DIR" && ! -L "$DATABASE_DIR" ]]; then
     chmod 700 "$DATABASE_DIR"
     chmod 600 "$ROOT_KEY"
     if chown -R "$KEYCAST_UID:$KEYCAST_GID" "$DATABASE_DIR" "$ROOT_KEY" 2>/dev/null; then
@@ -130,7 +157,24 @@ if [[ "$FIX_PERMISSIONS" == true && -f "$ROOT_KEY" && -d "$DATABASE_DIR" ]]; the
 elif [[ "$FIX_PERMISSIONS" == true ]]; then
     fail "cannot repair permissions until $ROOT_KEY and $DATABASE_DIR both exist"
 else
-    warn "permission repair not requested; use --fix-permissions before first container start"
+    if [[ -f "$ROOT_KEY" && ! -L "$ROOT_KEY" ]]; then
+        root_mode="$(file_mode "$ROOT_KEY")"
+        root_owner="$(file_owner "$ROOT_KEY")"
+        if [[ "$root_mode" == "600" && "$root_owner" == "$KEYCAST_UID" ]]; then
+            ok "master.key has mode 600 and owner $KEYCAST_UID"
+        else
+            fail "master.key has mode ${root_mode:-unknown}, owner ${root_owner:-unknown} (expected 600, uid $KEYCAST_UID); re-run with --fix-permissions"
+        fi
+    fi
+    if [[ -d "$DATABASE_DIR" && ! -L "$DATABASE_DIR" ]]; then
+        db_mode="$(file_mode "$DATABASE_DIR")"
+        db_owner="$(file_owner "$DATABASE_DIR")"
+        if [[ "$db_mode" == "700" && "$db_owner" == "$KEYCAST_UID" ]]; then
+            ok "database directory has mode 700 and owner $KEYCAST_UID"
+        else
+            fail "database directory has mode ${db_mode:-unknown}, owner ${db_owner:-unknown} (expected 700, uid $KEYCAST_UID); re-run with --fix-permissions"
+        fi
+    fi
 fi
 
 if [[ -z "$KEYCAST_OPERATOR_PUBKEYS" ]]; then
@@ -148,18 +192,23 @@ for component in API SIGNER WEB; do
     image_value="${!image_name:-$(env_value "$image_name")}"
     image_value="${image_value:-ghcr.io/marmot-protocol/keycast-$(echo "$component" | tr 'A-Z' 'a-z')}"
     # A digest only pins what you already trust. Verify it was produced by this
-    # repository's workflow instead of trusting a mutable tag it was read from.
-    if command -v gh >/dev/null 2>&1; then
+    # repository's master workflow instead of trusting a mutable tag it was read from.
+    if [[ "$SKIP_PROVENANCE" == true ]]; then
+        warn "provenance verification skipped for $component (--skip-provenance)"
+    elif command -v gh >/dev/null 2>&1; then
         # Always blocking. Carry the diagnostic so an authentication or network
         # failure is not reported as if the image simply had no provenance.
         if verify_output="$(gh attestation verify "oci://${image_value}@${digest_value}" \
-            --repo "$ATTESTATION_REPO" 2>&1)"; then
+            --repo "$ATTESTATION_REPO" \
+            --source-ref refs/heads/master \
+            --signer-workflow "${ATTESTATION_REPO}/.github/workflows/docker.yml" \
+            --deny-self-hosted-runners 2>&1)"; then
             ok "$component image digest has verified build provenance"
         else
             fail "$component provenance verification failed against $ATTESTATION_REPO: $(printf '%s' "$verify_output" | tr '\n' ' ' | cut -c1-300)"
         fi
     else
-        warn "gh is not installed; install it to verify $component build provenance with: gh attestation verify oci://${image_value}@${digest_value} --repo $ATTESTATION_REPO"
+        fail "gh is not installed; install gh to verify $component build provenance (or pass --skip-provenance explicitly)"
     fi
 done
 if command -v docker >/dev/null 2>&1; then

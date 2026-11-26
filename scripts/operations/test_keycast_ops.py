@@ -24,11 +24,27 @@ class OperationsTests(unittest.TestCase):
             stamp = directory / "last-offhost-success.json"
             stamp.write_text('{"completed_at":123}')
             config = {"backup_directory": tmp, "backup_key_file": "/not-read/test.key", "remote_directory": "test:offhost", "keep_local": 2}
-            with patch.object(ops, "run", side_effect=[None, RuntimeError("upload failed")]):
+
+            def fake_run(argv, timeout=300):
+                if "backup" in argv:
+                    Path(argv[-1]).write_text("new-unverified")
+                    return None
+                raise RuntimeError("upload failed")
+
+            with patch.object(ops, "run", side_effect=fake_run):
                 with self.assertRaises(RuntimeError):
                     ops.backup(config)
             self.assertEqual(json.loads(stamp.read_text())["completed_at"], 123)
             self.assertEqual(len(list(directory.glob("*.kcb"))), 4)
+
+    def test_bare_remote_root_joins_without_leading_slash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = {"backup_directory": tmp, "backup_key_file": "/not-read/test.key", "remote_directory": "b2:", "keep_local": 2}
+            with patch.object(ops, "run") as run:
+                self.assertTrue(ops.backup(config)["ok"])
+            copyto_args = run.call_args_list[1].args[0]
+            self.assertTrue(copyto_args[-1].startswith("b2:keycast-"))
+            self.assertFalse(copyto_args[-1].startswith("b2:/"))
 
     def test_verified_upload_precedes_success_and_local_retention(self):
         with tempfile.TemporaryDirectory() as tmp:

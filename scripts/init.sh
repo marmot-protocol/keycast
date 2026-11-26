@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DOMAIN=""
@@ -10,16 +11,24 @@ KEYCAST_GID=10001
 STATE_DIR_ARG=""
 
 usage() {
-    echo "Usage: $0 --domain <domain> --allowed-pubkeys <hex[,hex...]> [--operator-pubkeys <hex[,hex...]>] [--state-dir <path>]"
+    echo "Usage: $0 --domain <domain> --allowed-pubkeys <hex|npub[,...]> [--operator-pubkeys <hex|npub[,...]>] [--state-dir <path>]"
     echo "  --state-dir  Where the database and root credential live. Defaults to this checkout."
+}
+
+require_value() {
+    if [[ "$1" -lt 2 ]]; then
+        echo "Error: $2 requires a value"
+        usage
+        exit 1
+    fi
 }
 
 while [[ "$#" -gt 0 ]]; do
     case "$1" in
-        --domain) DOMAIN="${2:-}"; shift 2 ;;
-        --allowed-pubkeys) ALLOWED_PUBKEYS="${2:-}"; shift 2 ;;
-        --operator-pubkeys) OPERATOR_PUBKEYS="${2:-}"; shift 2 ;;
-        --state-dir) STATE_DIR_ARG="${2:-}"; shift 2 ;;
+        --domain) require_value "$#" "$1"; DOMAIN="$2"; shift 2 ;;
+        --allowed-pubkeys) require_value "$#" "$1"; ALLOWED_PUBKEYS="$2"; shift 2 ;;
+        --operator-pubkeys) require_value "$#" "$1"; OPERATOR_PUBKEYS="$2"; shift 2 ;;
+        --state-dir) require_value "$#" "$1"; STATE_DIR_ARG="$2"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Unknown argument: $1"; usage; exit 1 ;;
     esac
@@ -32,20 +41,25 @@ if [[ -z "$DOMAIN" || "$DOMAIN" =~ [^A-Za-z0-9.-] ]]; then
     echo "Error: provide a valid hostname with --domain"
     exit 1
 fi
+if [[ -n "$STATE_DIR_ARG" && "$STATE_DIR_ARG" =~ [$'\n'$'\r''$`'] ]]; then
+    echo "Error: --state-dir must not contain newlines or shell expansion characters"
+    exit 1
+fi
 if [[ -z "$ALLOWED_PUBKEYS" ]]; then
     echo "Error: --allowed-pubkeys is required; Keycast fails closed without it"
     exit 1
 fi
 OPERATOR_PUBKEYS="${OPERATOR_PUBKEYS:-${ALLOWED_PUBKEYS%%,*}}"
+PUBKEY_RE='([0-9a-fA-F]{64}|(npub1|NPUB1)[qpzry9x8gf2tvdw0s3jn54khce6mua7lQPZRY9X8GF2TVDW0S3JN54KHCE6MUA7L]{58})'
 for pubkey_list in "$ALLOWED_PUBKEYS" "$OPERATOR_PUBKEYS"; do
-    if [[ ! "$pubkey_list" =~ ^[0-9a-fA-F]{64}(,[0-9a-fA-F]{64})*$ ]]; then
-        echo "Error: pubkeys must be comma-separated 64-character hex values without whitespace or empty fields"
+    if [[ ! "$pubkey_list" =~ ^${PUBKEY_RE}(,${PUBKEY_RE})*$ ]]; then
+        echo "Error: pubkeys must be comma-separated 64-character hex or npub1 values without whitespace or empty fields"
         exit 1
     fi
 done
 
 cd "$ROOT_DIR"
-if [[ -e .env ]]; then
+if [[ -e .env || -L .env ]]; then
     echo "Error: .env already exists; refusing to overwrite it"
     exit 1
 fi
@@ -59,8 +73,16 @@ else
 fi
 DATABASE_DIR="$STATE_DIR/database"
 ROOT_KEY="$STATE_DIR/master.key"
+if [[ -d "$DATABASE_DIR/migrations" ]]; then
+    echo "Error: $DATABASE_DIR contains tracked migrations/; pass --state-dir <path> (e.g. ./state or /srv/keycast)"
+    exit 1
+fi
+if [[ -L "$ROOT_KEY" || -L "$DATABASE_DIR" ]]; then
+    echo "Error: refusing to operate on symlinked state paths"
+    exit 1
+fi
 mkdir -p "$STATE_DIR"
-if [[ ! -f "$ROOT_KEY" ]]; then
+if [[ ! -e "$ROOT_KEY" ]]; then
     KEYCAST_ROOT_KEY_PATH="$ROOT_KEY" bash "$ROOT_DIR/scripts/generate_key.sh"
 fi
 mkdir -p "$DATABASE_DIR"

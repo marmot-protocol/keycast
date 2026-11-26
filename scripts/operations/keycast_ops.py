@@ -68,9 +68,13 @@ def backup_locked(config, directory):
     run(signer + ["backup", config["backup_key_file"], str(archive)], 1800)
     # Completion means upload and a byte-for-byte readback succeeded. A provider ACK alone is
     # insufficient. This uses download verification without creating another local plaintext file.
-    target = remote.rstrip("/") + "/" + name
-    run(rclone + ["copyto", str(archive), target], 1800)
-    run(rclone + ["check", str(directory), remote, "--include", "/" + name, "--one-way", "--download"], 1800)
+    target = remote + name if remote.endswith(":") else remote.rstrip("/") + "/" + name
+    try:
+        run(rclone + ["copyto", str(archive), target], 1800)
+        run(rclone + ["check", str(directory), remote, "--include", "/" + name, "--one-way", "--download"], 1800)
+    except BaseException:
+        archive.unlink(missing_ok=True)
+        raise
     atomic_stamp(stamp)
     # Only prune owned local archives after off-host verification. Remote retention is deliberately
     # delegated to the operator's versioned/immutable bucket policy; never delete remote backups here.
