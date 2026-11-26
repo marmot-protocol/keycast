@@ -54,6 +54,8 @@ fn protected_routes(state: KeycastState) -> Router<KeycastState> {
             "/teams/{id}/invitations/{invitation_id}",
             delete(teams::revoke_invitation),
         )
+        .route("/teams/{id}/grants", get(teams::list_grants))
+        .route("/teams/{id}/diagnostics", get(teams::list_diagnostics))
         .route("/teams/{id}/audit", get(teams::list_audit))
         .layer(middleware::from_fn_with_state(
             state.clone(),

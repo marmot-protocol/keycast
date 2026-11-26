@@ -20,7 +20,7 @@ use zeroize::Zeroizing;
 pub struct Store {
     pub pool: SqlitePool,
     pub cipher: EnvelopeCipher,
-    pub authority: std::sync::Arc<tokio::sync::Mutex<()>>,
+    pub authority: std::sync::Arc<tokio::sync::RwLock<()>>,
 }
 
 #[derive(Debug, Clone)]
@@ -77,7 +77,7 @@ impl Store {
         Self {
             pool,
             cipher,
-            authority: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            authority: std::sync::Arc::new(tokio::sync::RwLock::new(())),
         }
     }
 
@@ -595,6 +595,61 @@ impl Store {
             .bind(grant).bind(hash.as_slice()).bind(client.to_hex()).fetch_one(&self.pool).await?)
     }
 
+    /// Classify why a pre-admission `connect` was rejected so operators can
+    /// troubleshoot without exposing secrets or writing unauthenticated spam to SQLite.
+    pub async fn diagnose_connect_rejection(
+        &self,
+        grant_id: i64,
+        secret: &str,
+    ) -> Result<(&'static str, serde_json::Value), StoreError> {
+        if secret.is_empty() {
+            return Ok(("secret_missing", serde_json::json!({})));
+        }
+        let supplied_hash = Sha256::digest(secret.as_bytes());
+        let matched: Option<(i64, Option<i64>, Option<i64>, i64)> = query_as(
+            "SELECT id, consumed_at, revoked_at, expires_at
+             FROM invitations WHERE grant_id = ? AND secret_hash = ? LIMIT 1",
+        )
+        .bind(grant_id)
+        .bind(supplied_hash.as_slice())
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some((invitation_id, consumed_at, revoked_at, expires_at)) = matched else {
+            return Ok(("secret_mismatch", serde_json::json!({})));
+        };
+        if consumed_at.is_some() {
+            let claimed_by: Option<String> = query_scalar(
+                "SELECT client_public_key FROM sessions WHERE invitation_id = ? LIMIT 1",
+            )
+            .bind(invitation_id)
+            .fetch_optional(&self.pool)
+            .await?;
+            return Ok((
+                "secret_already_consumed",
+                serde_json::json!({
+                    "invitation_id": invitation_id,
+                    "claimed_by_client_public_key": claimed_by,
+                }),
+            ));
+        }
+        if revoked_at.is_some() {
+            return Ok((
+                "secret_revoked",
+                serde_json::json!({ "invitation_id": invitation_id }),
+            ));
+        }
+        if expires_at <= chrono::Utc::now().timestamp() {
+            return Ok((
+                "secret_expired",
+                serde_json::json!({ "invitation_id": invitation_id }),
+            ));
+        }
+        Ok((
+            "invitation_not_claimable",
+            serde_json::json!({ "invitation_id": invitation_id }),
+        ))
+    }
+
     pub async fn claim_invitation(
         &self,
         grant: &RuntimeGrant,
@@ -800,6 +855,7 @@ impl Store {
         Ok(reclaimed.rows_affected() == 1)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn cache_response(
         &self,
         event_id: &str,
@@ -807,6 +863,7 @@ impl Store {
         response_json: &str,
         approved: bool,
         reason: Option<&str>,
+        details_json: &str,
         logout: bool,
     ) -> Result<(), StoreError> {
         let mut tx = self.pool.begin().await?;
@@ -822,9 +879,9 @@ impl Store {
         .bind(event_id)
         .execute(&mut *tx)
         .await?;
-        query("INSERT INTO audit_events(team_id,stored_key_id,grant_id,session_id,actor_public_key,action,outcome,reason_code,request_event_id)
-            SELECT g.team_id,g.stored_key_id,g.id,r.session_id,r.client_public_key,'nip46.'||r.method,?,r.reason_code,r.event_id FROM processed_requests r JOIN grants g ON g.id=r.grant_id WHERE r.event_id=?")
-            .bind(if approved {"allowed"} else {"denied"}).bind(event_id).execute(&mut *tx).await?;
+        query("INSERT INTO audit_events(team_id,stored_key_id,grant_id,session_id,actor_public_key,action,outcome,reason_code,request_event_id,details)
+            SELECT g.team_id,g.stored_key_id,g.id,r.session_id,r.client_public_key,'nip46.'||r.method,?,r.reason_code,r.event_id,? FROM processed_requests r JOIN grants g ON g.id=r.grant_id WHERE r.event_id=?")
+            .bind(if approved {"allowed"} else {"denied"}).bind(details_json).bind(event_id).execute(&mut *tx).await?;
         if logout {
             query("UPDATE sessions SET ended_at=unixepoch(),end_reason='logout' WHERE id=? AND ended_at IS NULL").bind(session_id).execute(&mut *tx).await?;
         }

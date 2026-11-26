@@ -129,6 +129,7 @@ pub async fn delete_team(
         return Err(ApiError::NotFound);
     }
     transaction.commit().await?;
+    state.signer.runtime.grant_diagnostics.remove_team(id);
     state.signer.request(LifecycleRequest::Reload).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -251,14 +252,15 @@ pub async fn remove_key(
         .map_err(|_| ApiError::bad_request("invalid key public key"))?
         .to_hex();
     let mut transaction = state.db.begin().await?;
-    let result = query("DELETE FROM stored_keys WHERE team_id = ? AND public_key = ?")
-        .bind(id)
-        .bind(pubkey)
-        .execute(&mut *transaction)
-        .await?;
-    if result.rows_affected() == 0 {
+    let removed_key_id: Option<i64> =
+        query_scalar("DELETE FROM stored_keys WHERE team_id = ? AND public_key = ? RETURNING id")
+            .bind(id)
+            .bind(pubkey)
+            .fetch_optional(&mut *transaction)
+            .await?;
+    let Some(removed_key_id) = removed_key_id else {
         return Err(ApiError::NotFound);
-    }
+    };
     audit_control(
         &mut transaction,
         id,
@@ -268,6 +270,11 @@ pub async fn remove_key(
     )
     .await?;
     transaction.commit().await?;
+    state
+        .signer
+        .runtime
+        .grant_diagnostics
+        .remove_stored_key(id, removed_key_id);
     state.signer.request(LifecycleRequest::Reload).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -282,62 +289,7 @@ pub async fn get_key(
         .map_err(|_| ApiError::bad_request("invalid key public key"))?
         .to_hex();
     let stored_key = stored_key_by_pubkey(&state.db, id, &pubkey).await?;
-    let rows: Vec<(
-        i64,
-        i64,
-        i64,
-        i64,
-        String,
-        String,
-        Option<i64>,
-        Option<i64>,
-        i64,
-        i64,
-        i64,
-        i64,
-    )> = query_as(
-        "SELECT g.id, g.team_id, g.stored_key_id, g.policy_id, g.name,
-                g.remote_signer_public_key, g.expires_at, g.revoked_at,
-                g.created_at, g.updated_at,
-                (SELECT count(*) FROM sessions s WHERE s.grant_id = g.id AND s.ended_at IS NULL
-                    AND g.revoked_at IS NULL AND (g.expires_at IS NULL OR g.expires_at > unixepoch())),
-                (SELECT count(*) FROM invitations i WHERE i.grant_id = g.id
-                    AND i.consumed_at IS NULL AND i.revoked_at IS NULL AND i.expires_at > unixepoch()
-                    AND g.revoked_at IS NULL AND (g.expires_at IS NULL OR g.expires_at > unixepoch()))
-         FROM grants g WHERE g.stored_key_id = ? ORDER BY g.created_at DESC",
-    )
-    .bind(stored_key.id)
-    .fetch_all(&state.db)
-    .await?;
-    let rows_invitations: Vec<(i64,i64,i64)> = query_as("SELECT i.grant_id,i.id,i.expires_at FROM invitations i JOIN grants g ON g.id=i.grant_id WHERE g.stored_key_id=? AND g.revoked_at IS NULL AND (g.expires_at IS NULL OR g.expires_at>unixepoch()) AND i.consumed_at IS NULL AND i.revoked_at IS NULL AND i.expires_at>unixepoch() ORDER BY i.id")
-        .bind(stored_key.id).fetch_all(&state.db).await?;
-    let mut invitations_by_grant = std::collections::HashMap::<_, Vec<_>>::new();
-    for (grant_id, id, expires_at) in rows_invitations {
-        invitations_by_grant
-            .entry(grant_id)
-            .or_default()
-            .push(crate::management::api::types::InvitationStatus { id, expires_at });
-    }
-    let mut grants = Vec::new();
-    for row in rows {
-        grants.push(GrantWithStatus {
-            grant: keycast_core::v2::control::GrantSummary {
-                id: row.0,
-                team_id: row.1,
-                stored_key_id: row.2,
-                policy_id: row.3,
-                name: row.4,
-                remote_signer_public_key: row.5,
-                expires_at: row.6,
-                revoked_at: row.7,
-                created_at: row.8,
-                updated_at: row.9,
-            },
-            active_sessions: row.10,
-            claimable_invitations: row.11,
-            invitations: invitations_by_grant.remove(&row.0).unwrap_or_default(),
-        });
-    }
+    let grants = load_grants(&state, id, Some(stored_key.id)).await?;
     let relay_discovery = state
         .signer
         .runtime
@@ -351,6 +303,244 @@ pub async fn get_key(
         stored_key,
         grants,
     }))
+}
+
+pub async fn list_grants(
+    State(state): State<KeycastState>,
+    AuthEvent(event): AuthEvent,
+    Path(id): Path<i64>,
+) -> ApiResult<Json<Vec<GrantWithStatus>>> {
+    require_admin(&state.db, id, &event.pubkey.to_hex()).await?;
+    Ok(Json(load_grants(&state, id, None).await?))
+}
+
+pub async fn list_diagnostics(
+    State(state): State<KeycastState>,
+    AuthEvent(event): AuthEvent,
+    Path(id): Path<i64>,
+) -> ApiResult<Json<Vec<crate::grant_diagnostics::GrantDiagnosticEvent>>> {
+    require_admin(&state.db, id, &event.pubkey.to_hex()).await?;
+    Ok(Json(
+        state.signer.runtime.grant_diagnostics.list_for_team(id),
+    ))
+}
+
+async fn load_grants(
+    state: &KeycastState,
+    team_id: i64,
+    stored_key_id: Option<i64>,
+) -> ApiResult<Vec<GrantWithStatus>> {
+    let now = chrono::Utc::now().timestamp();
+    let rows: Vec<(
+        i64,
+        i64,
+        i64,
+        i64,
+        String,
+        String,
+        Option<i64>,
+        Option<i64>,
+        i64,
+        i64,
+        String,
+        String,
+        String,
+        i64,
+        i64,
+    )> = query_as(
+        "SELECT g.id, g.team_id, g.stored_key_id, g.policy_id, g.name,
+                g.remote_signer_public_key, g.expires_at, g.revoked_at,
+                g.created_at, g.updated_at,
+                k.name, k.public_key, p.name,
+                (SELECT count(*) FROM sessions s WHERE s.grant_id = g.id AND s.ended_at IS NULL
+                    AND g.revoked_at IS NULL AND (g.expires_at IS NULL OR g.expires_at > unixepoch())),
+                (SELECT count(*) FROM invitations i WHERE i.grant_id = g.id
+                    AND i.consumed_at IS NULL AND i.revoked_at IS NULL AND i.expires_at > unixepoch()
+                    AND g.revoked_at IS NULL AND (g.expires_at IS NULL OR g.expires_at > unixepoch()))
+         FROM grants g
+         JOIN stored_keys k ON k.id = g.stored_key_id AND k.team_id = g.team_id
+         JOIN policies p ON p.id = g.policy_id AND p.team_id = g.team_id
+         WHERE g.team_id = ? AND (? IS NULL OR g.stored_key_id = ?)
+         ORDER BY g.revoked_at IS NOT NULL, g.created_at DESC",
+    )
+    .bind(team_id)
+    .bind(stored_key_id)
+    .bind(stored_key_id)
+    .fetch_all(&state.db)
+    .await?;
+
+    let rows_invitations: Vec<(i64, i64, i64, i64, Option<i64>, Option<i64>, Option<String>)> =
+        query_as(
+            "SELECT grant_id, id, created_at, expires_at, consumed_at, revoked_at, claimed_by
+             FROM (
+                 SELECT i.grant_id, i.id, i.created_at, i.expires_at, i.consumed_at, i.revoked_at,
+                        (SELECT s.client_public_key FROM sessions s WHERE s.invitation_id = i.id LIMIT 1) AS claimed_by,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY i.grant_id
+                            ORDER BY (i.consumed_at IS NULL AND i.revoked_at IS NULL AND i.expires_at > unixepoch()) DESC,
+                                     i.id DESC
+                        ) AS rn
+                 FROM invitations i
+                 JOIN grants g ON g.id = i.grant_id
+                 WHERE g.team_id = ? AND (? IS NULL OR g.stored_key_id = ?)
+             )
+             WHERE rn <= 12
+             ORDER BY rn ASC",
+        )
+        .bind(team_id)
+        .bind(stored_key_id)
+        .bind(stored_key_id)
+        .fetch_all(&state.db)
+        .await?;
+
+    let mut claimable_by_grant = std::collections::HashMap::<i64, Vec<InvitationStatus>>::new();
+    let mut recent_inv_by_grant = std::collections::HashMap::<i64, Vec<InvitationDetail>>::new();
+    for (grant_id, inv_id, created_at, expires_at, consumed_at, revoked_at, claimed_by) in
+        rows_invitations
+    {
+        let status = if consumed_at.is_some() {
+            "claimed"
+        } else if revoked_at.is_some() {
+            "revoked"
+        } else if expires_at <= now {
+            "expired"
+        } else {
+            "claimable"
+        };
+        if status == "claimable" {
+            let claimable = claimable_by_grant.entry(grant_id).or_default();
+            if claimable.len() < 12 {
+                claimable.push(InvitationStatus {
+                    id: inv_id,
+                    expires_at,
+                });
+            }
+        }
+        let list = recent_inv_by_grant.entry(grant_id).or_default();
+        if list.len() < 12 {
+            list.push(InvitationDetail {
+                id: inv_id,
+                created_at,
+                expires_at,
+                consumed_at,
+                revoked_at,
+                claimed_by_client_public_key: claimed_by,
+                status,
+            });
+        }
+    }
+    for invs in claimable_by_grant.values_mut() {
+        invs.sort_by_key(|i| i.id);
+    }
+
+    let rows_sessions: Vec<(
+        i64,
+        i64,
+        i64,
+        String,
+        Option<String>,
+        Option<String>,
+        i64,
+        i64,
+        Option<i64>,
+        Option<String>,
+    )> = query_as(
+        "SELECT grant_id, id, invitation_id, client_public_key, client_metadata,
+                requested_capabilities, connected_at, last_seen_at, ended_at, end_reason
+         FROM (
+             SELECT s.grant_id, s.id, s.invitation_id, s.client_public_key, s.client_metadata,
+                    s.requested_capabilities, s.connected_at, s.last_seen_at, s.ended_at, s.end_reason,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY s.grant_id
+                        ORDER BY s.ended_at IS NOT NULL, s.last_seen_at DESC, s.id DESC
+                    ) AS rn
+             FROM sessions s
+             JOIN grants g ON g.id = s.grant_id
+             WHERE g.team_id = ? AND (? IS NULL OR g.stored_key_id = ?)
+         )
+         WHERE rn <= 12
+         ORDER BY rn ASC",
+    )
+    .bind(team_id)
+    .bind(stored_key_id)
+    .bind(stored_key_id)
+    .fetch_all(&state.db)
+    .await?;
+
+    let mut sessions_by_grant = std::collections::HashMap::<i64, Vec<SessionStatus>>::new();
+    for (
+        grant_id,
+        session_id,
+        invitation_id,
+        client_public_key,
+        client_metadata,
+        requested_capabilities,
+        connected_at,
+        last_seen_at,
+        ended_at,
+        end_reason,
+    ) in rows_sessions
+    {
+        let list = sessions_by_grant.entry(grant_id).or_default();
+        if list.len() < 12 {
+            list.push(SessionStatus {
+                id: session_id,
+                invitation_id,
+                client_public_key,
+                client_metadata: client_metadata
+                    .as_deref()
+                    .filter(|raw| raw.len() <= 4096)
+                    .and_then(|raw| serde_json::from_str(raw).ok()),
+                requested_capabilities: requested_capabilities
+                    .as_deref()
+                    .filter(|raw| raw.len() <= 4096)
+                    .and_then(|raw| serde_json::from_str(raw).ok()),
+                connected_at,
+                last_seen_at,
+                ended_at,
+                end_reason,
+            });
+        }
+    }
+
+    let drop_counts = state
+        .signer
+        .runtime
+        .grant_diagnostics
+        .counts_for_team(team_id);
+
+    let mut grants = Vec::with_capacity(rows.len());
+    for row in rows {
+        let grant_live = row.7.is_none() && row.6.is_none_or(|exp| exp > now);
+        grants.push(GrantWithStatus {
+            grant: keycast_core::v2::control::GrantSummary {
+                id: row.0,
+                team_id: row.1,
+                stored_key_id: row.2,
+                policy_id: row.3,
+                name: row.4,
+                remote_signer_public_key: row.5,
+                expires_at: row.6,
+                revoked_at: row.7,
+                created_at: row.8,
+                updated_at: row.9,
+            },
+            stored_key_name: row.10,
+            stored_key_public_key: row.11,
+            policy_name: row.12,
+            active_sessions: row.13,
+            claimable_invitations: row.14,
+            invitations: if grant_live {
+                claimable_by_grant.remove(&row.0).unwrap_or_default()
+            } else {
+                Vec::new()
+            },
+            recent_invitations: recent_inv_by_grant.remove(&row.0).unwrap_or_default(),
+            sessions: sessions_by_grant.remove(&row.0).unwrap_or_default(),
+            recent_drops: drop_counts.get(&row.0).copied().unwrap_or(0),
+        });
+    }
+    Ok(grants)
 }
 
 pub async fn add_policy(
@@ -578,14 +768,16 @@ pub async fn list_audit(
         i64,
         Option<i64>,
         Option<i64>,
+        Option<i64>,
         Option<String>,
         String,
         String,
         Option<String>,
         Option<String>,
+        String,
     )> = query_as(
-        "SELECT id, occurred_at, grant_id, session_id, actor_public_key, action,
-                outcome, reason_code, request_event_id
+        "SELECT id, occurred_at, stored_key_id, grant_id, session_id, actor_public_key, action,
+                outcome, reason_code, request_event_id, details
          FROM audit_events WHERE team_id = ? ORDER BY occurred_at DESC, id DESC LIMIT 200",
     )
     .bind(id)
@@ -596,13 +788,15 @@ pub async fn list_audit(
             .map(|row| AuditEvent {
                 id: row.0,
                 occurred_at: row.1,
-                grant_id: row.2,
-                session_id: row.3,
-                actor_public_key: row.4,
-                action: row.5,
-                outcome: row.6,
-                reason_code: row.7,
-                request_event_id: row.8,
+                stored_key_id: row.2,
+                grant_id: row.3,
+                session_id: row.4,
+                actor_public_key: row.5,
+                action: row.6,
+                outcome: row.7,
+                reason_code: row.8,
+                request_event_id: row.9,
+                details: serde_json::from_str(&row.10).unwrap_or_else(|_| serde_json::json!({})),
             })
             .collect(),
     ))
@@ -1055,11 +1249,15 @@ async fn audit_control(
 }
 
 pub fn is_operator(actor: &str) -> bool {
+    let Ok(actor_hex) = PublicKey::from_hex(actor.trim()).map(|pk| pk.to_hex()) else {
+        return false;
+    };
     std::env::var("KEYCAST_OPERATOR_PUBKEYS")
         .unwrap_or_default()
         .split(',')
         .map(str::trim)
-        .any(|p| p.eq_ignore_ascii_case(actor))
+        .filter(|p| !p.is_empty())
+        .any(|p| p.eq_ignore_ascii_case(&actor_hex))
 }
 pub fn require_operator(actor: &str) -> ApiResult<()> {
     if is_operator(actor) {

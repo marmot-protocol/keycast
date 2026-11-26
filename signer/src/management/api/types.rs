@@ -104,19 +104,49 @@ pub struct TeamWithRelations {
     pub policies: Vec<PolicySummary>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct InvitationStatus {
     pub id: i64,
     pub expires_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct InvitationDetail {
+    pub id: i64,
+    pub created_at: i64,
+    pub expires_at: i64,
+    pub consumed_at: Option<i64>,
+    pub revoked_at: Option<i64>,
+    pub claimed_by_client_public_key: Option<String>,
+    pub status: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionStatus {
+    pub id: i64,
+    pub invitation_id: i64,
+    pub client_public_key: String,
+    pub client_metadata: Option<serde_json::Value>,
+    pub requested_capabilities: Option<Vec<String>>,
+    pub connected_at: i64,
+    pub last_seen_at: i64,
+    pub ended_at: Option<i64>,
+    pub end_reason: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct GrantWithStatus {
     #[serde(flatten)]
     pub grant: GrantSummary,
+    pub stored_key_name: String,
+    pub stored_key_public_key: String,
+    pub policy_name: String,
     pub active_sessions: i64,
     pub claimable_invitations: i64,
     pub invitations: Vec<InvitationStatus>,
+    pub recent_invitations: Vec<InvitationDetail>,
+    pub sessions: Vec<SessionStatus>,
+    pub recent_drops: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -182,6 +212,7 @@ pub struct RelayStatus {
 pub struct AuditEvent {
     pub id: i64,
     pub occurred_at: i64,
+    pub stored_key_id: Option<i64>,
     pub grant_id: Option<i64>,
     pub session_id: Option<i64>,
     pub actor_public_key: Option<String>,
@@ -189,6 +220,7 @@ pub struct AuditEvent {
     pub outcome: String,
     pub reason_code: Option<String>,
     pub request_event_id: Option<String>,
+    pub details: serde_json::Value,
 }
 
 #[derive(Debug, Deserialize)]

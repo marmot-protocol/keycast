@@ -26,6 +26,7 @@ pub struct RuntimeState {
             std::collections::BTreeMap<String, crate::relay_diagnostics::RelayDiagnostics>,
         >,
     >,
+    pub grant_diagnostics: Arc<crate::grant_diagnostics::GrantDiagnostics>,
     pub ready: Arc<AtomicBool>,
     pub integrity_ok: Arc<AtomicBool>,
     pub quarantined_grants: Arc<AtomicUsize>,
@@ -54,6 +55,7 @@ impl RuntimeState {
             metrics: Arc::new(RuntimeMetrics::default()),
             connected_relays: Arc::new(AtomicUsize::new(0)),
             relay_diagnostics: Default::default(),
+            grant_diagnostics: Arc::new(crate::grant_diagnostics::GrantDiagnostics::default()),
             ready: Arc::new(AtomicBool::new(false)),
             integrity_ok: Arc::new(AtomicBool::new(true)),
             quarantined_grants: Arc::new(AtomicUsize::new(0)),
@@ -214,7 +216,11 @@ pub async fn relay_supervisor(
     let mut telemetry_flush = tokio::time::interval(Duration::from_secs(1));
     let mut pending_telemetry = Vec::new();
     let mut notifications = client.notifications();
-    let processor = RequestProcessor::new(state.store.clone(), state.metrics.clone());
+    let processor = RequestProcessor::with_diagnostics(
+        state.store.clone(),
+        state.metrics.clone(),
+        state.grant_diagnostics.clone(),
+    );
     let mut workers = tokio::task::JoinSet::new();
     let mut worker_events = HashMap::new();
     let mut publishers = tokio::task::JoinSet::<(String, bool, bool)>::new();
@@ -246,6 +252,7 @@ pub async fn relay_supervisor(
     // (remote signer pubkey, client pubkey) pairs with a live session, refreshed
     // with the grant configuration. Bounded by the sessions capacity trigger.
     let mut live_sessions = HashSet::<(String, String)>::new();
+    let mut grant_targets = HashMap::<String, (i64, i64, i64)>::new();
     let mut minimum = 1i64;
     let mut recovery_pending = false;
     let mut delivery_failure: Option<std::time::Instant> = None;
@@ -333,6 +340,19 @@ pub async fn relay_supervisor(
                                     Err(reason) => {
                                         state.metrics.ingress_rejections.fetch_add(1,Ordering::Relaxed);
                                         telemetry.record(relay_url.as_str(), reason);
+                                        if let Some(&(grant_id, team_id, stored_key_id)) = grant_targets.get(&target_hex) {
+                                            state.grant_diagnostics.record_drop(
+                                                team_id,
+                                                stored_key_id,
+                                                grant_id,
+                                                Some(peer.clone()),
+                                                Some(id.clone()),
+                                                None,
+                                                "rate_limited",
+                                                Some(relay_url.to_string()),
+                                                serde_json::json!({ "admission_reason": reason }),
+                                            );
+                                        }
                                         return Ok(true);
                                     }
                                 };
@@ -343,7 +363,7 @@ pub async fn relay_supervisor(
                                 let worker_id = id.clone();
                                 let task = workers.spawn(async move {
                                     let _ticket = ticket;
-                                    let result = processor.prepare_response(&event).await;
+                                    let result = processor.prepare_response_from_relay(&event, Some(relay_url.as_str())).await;
                                     if result.is_ok() {
                                         let _ = store.mark_relay_received(relay_url.as_str(), &id, event.created_at.as_secs() as i64).await;
                                     }
@@ -429,6 +449,10 @@ pub async fn relay_supervisor(
                     completed = sqlx::query_scalar::query_scalar::<_, String>("SELECT event_id FROM processed_requests WHERE response_event_json IS NOT NULL ORDER BY received_at DESC LIMIT 10000")
                         .fetch_all(&state.store.pool).await?.into_iter().collect();
                     let grants = state.store.active_grants().await?;
+                    grant_targets = grants
+                        .iter()
+                        .map(|g| (g.remote_signer_public_key.clone(), (g.id, g.team_id, g.stored_key_id)))
+                        .collect();
                     live_sessions = sqlx::query_as::query_as::<_, (String, String)>(
                         "SELECT g.remote_signer_public_key,s.client_public_key FROM sessions s JOIN grants g ON g.id=s.grant_id WHERE s.ended_at IS NULL AND g.revoked_at IS NULL AND (g.expires_at IS NULL OR g.expires_at>unixepoch())")
                         .fetch_all(&state.store.pool).await?.into_iter().collect();

@@ -990,7 +990,7 @@ async fn runtime_isolates_noisy_grant_before_waiting_for_authority() {
     let (stop, rx) = tokio::sync::watch::channel(false);
     let task = tokio::spawn(relay_supervisor(state.clone(), rx));
     ready(&state).await;
-    let authority = f.store.authority.lock().await;
+    let authority = f.store.authority.write().await;
     for n in 0..12 {
         let attacker = Keys::generate();
         let event = EventBuilder::new(Kind::NostrConnect, format!("invalid-{n}"))
@@ -1063,7 +1063,7 @@ async fn forged_flood_cannot_starve_a_client_that_already_holds_a_session() {
 
     // Hold the authority gate so admitted workers occupy their lane, then flood
     // from rotating keys the way an attacker on a shared relay would.
-    let authority = f.store.authority.lock().await;
+    let authority = f.store.authority.write().await;
     let before = state.metrics.ingress_rejections.load(Ordering::Relaxed);
     for n in 0..24 {
         let attacker = Keys::generate();
@@ -1804,7 +1804,7 @@ async fn completed_reconnect_backlog_does_not_reject_fresh_requests() {
     ready(&state).await;
     // Runtime restart loaded only durable IDs. Hold authority to keep the replay
     // workers busy while all thirteen old requests and a fresh one arrive.
-    let authority = f.store.authority.lock().await;
+    let authority = f.store.authority.write().await;
     for event in &requests {
         observer.send_event(event).await.unwrap();
     }
