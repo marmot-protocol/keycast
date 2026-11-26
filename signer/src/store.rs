@@ -317,7 +317,7 @@ impl Store {
         let actor_public_key = PublicKey::from_hex(actor_public_key)?.to_hex();
         let mut transaction = self.pool.begin().await?;
         let revoked: Option<(i64, i64)> = query_as(
-            "UPDATE grants SET revoked_at = unixepoch(), updated_at = unixepoch()
+            "UPDATE grants SET revoked_at = max(unixepoch(), created_at), updated_at = max(unixepoch(), created_at)
              WHERE id = ? AND revoked_at IS NULL RETURNING team_id, stored_key_id",
         )
         .bind(grant_id)
@@ -325,14 +325,14 @@ impl Store {
         .await?;
         let (team_id, stored_key_id) = revoked.ok_or(StoreError::NotFound)?;
         query(
-            "UPDATE invitations SET revoked_at = unixepoch()
+            "UPDATE invitations SET revoked_at = max(unixepoch(), created_at)
              WHERE grant_id = ? AND consumed_at IS NULL AND revoked_at IS NULL",
         )
         .bind(grant_id)
         .execute(&mut *transaction)
         .await?;
         query(
-            "UPDATE sessions SET ended_at = unixepoch(), end_reason = 'revoked'
+            "UPDATE sessions SET ended_at = max(unixepoch(), connected_at), end_reason = 'revoked'
              WHERE grant_id = ? AND ended_at IS NULL",
         )
         .bind(grant_id)
@@ -362,7 +362,7 @@ impl Store {
         let actor_public_key = PublicKey::from_hex(actor_public_key)?.to_hex();
         let mut transaction = self.pool.begin().await?;
         let grant_id: Option<i64> = query_scalar(
-            "UPDATE invitations SET revoked_at = unixepoch()
+            "UPDATE invitations SET revoked_at = max(unixepoch(), created_at)
              WHERE id = ? AND consumed_at IS NULL AND revoked_at IS NULL RETURNING grant_id",
         )
         .bind(invitation_id)
@@ -746,7 +746,7 @@ impl Store {
             };
 
             query(
-                "UPDATE sessions SET ended_at = unixepoch(), end_reason = 'replaced'
+                "UPDATE sessions SET ended_at = max(unixepoch(), connected_at), end_reason = 'replaced'
                  WHERE grant_id = ? AND client_public_key = ? AND ended_at IS NULL",
             )
             .bind(grant.id)
@@ -754,7 +754,7 @@ impl Store {
             .execute(&mut *connection)
             .await?;
             let consumed = query(
-                "UPDATE invitations SET consumed_at = unixepoch()
+                "UPDATE invitations SET consumed_at = max(unixepoch(), created_at)
                  WHERE id = ? AND consumed_at IS NULL AND revoked_at IS NULL
                    AND expires_at > unixepoch()",
             )
@@ -923,7 +923,7 @@ impl Store {
             SELECT g.team_id,g.stored_key_id,g.id,r.session_id,r.client_public_key,'nip46.'||r.method,?,r.reason_code,r.event_id,? FROM processed_requests r JOIN grants g ON g.id=r.grant_id WHERE r.event_id=?")
             .bind(if approved {"allowed"} else {"denied"}).bind(details_json).bind(event_id).execute(&mut *tx).await?;
         if logout {
-            query("UPDATE sessions SET ended_at=unixepoch(),end_reason='logout' WHERE id=? AND ended_at IS NULL").bind(session_id).execute(&mut *tx).await?;
+            query("UPDATE sessions SET ended_at=max(unixepoch(),connected_at),end_reason='logout' WHERE id=? AND ended_at IS NULL").bind(session_id).execute(&mut *tx).await?;
         }
         tx.commit().await?;
         Ok(())
@@ -1062,7 +1062,7 @@ impl Store {
         Ok(())
     }
     pub async fn maintenance(&self) -> Result<(), StoreError> {
-        query("UPDATE sessions SET ended_at=unixepoch(),end_reason='expired' WHERE ended_at IS NULL AND grant_id IN (SELECT id FROM grants WHERE expires_at<=unixepoch())").execute(&self.pool).await?;
+        query("UPDATE sessions SET ended_at=max(unixepoch(),connected_at),end_reason='expired' WHERE ended_at IS NULL AND grant_id IN (SELECT id FROM grants WHERE expires_at<=unixepoch())").execute(&self.pool).await?;
 
         query("DELETE FROM audit_events WHERE id IN (SELECT id FROM audit_events WHERE occurred_at<unixepoch()-2592000 ORDER BY occurred_at LIMIT 500)").execute(&self.pool).await?;
         query("DELETE FROM management_nonces WHERE accepted_at<unixepoch()-600")
@@ -1070,6 +1070,10 @@ impl Store {
             .await?;
         query("DELETE FROM invitations WHERE id IN (SELECT id FROM invitations WHERE expires_at<unixepoch()-2592000 AND NOT EXISTS(SELECT 1 FROM sessions WHERE invitation_id=invitations.id) LIMIT 500)").execute(&self.pool).await?;
         query("DELETE FROM sessions WHERE id IN (SELECT id FROM sessions WHERE ended_at<unixepoch()-2592000 LIMIT 500)").execute(&self.pool).await?;
+        // Prune long-revoked or long-expired grants and unreferenced soft-deleted policies
+        // so historical tombstones cannot permanently exhaust the 1,000-row capacity triggers.
+        query("DELETE FROM grants WHERE id IN (SELECT id FROM grants WHERE (revoked_at<unixepoch()-2592000 OR (expires_at IS NOT NULL AND expires_at<unixepoch()-2592000)) AND NOT EXISTS(SELECT 1 FROM sessions WHERE grant_id=grants.id) AND NOT EXISTS(SELECT 1 FROM invitations WHERE grant_id=grants.id) AND NOT EXISTS(SELECT 1 FROM processed_requests WHERE grant_id=grants.id) LIMIT 200)").execute(&self.pool).await?;
+        query("DELETE FROM policies WHERE id IN (SELECT id FROM policies WHERE deleted_at<unixepoch()-2592000 AND NOT EXISTS(SELECT 1 FROM grants WHERE policy_id=policies.id) LIMIT 200)").execute(&self.pool).await?;
         Ok(())
     }
     pub async fn pending_inputs(&self) -> Result<Vec<String>, StoreError> {
