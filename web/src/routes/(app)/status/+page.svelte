@@ -1,5 +1,6 @@
 <script lang="ts">
     import { softwareVersion, buildRevision } from "#lib/version";
+    import Copy from "#lib/components/Copy.svelte";
     import RelayHealthRow from "#lib/components/RelayHealthRow.svelte";
     import Loader from "#lib/components/Loader.svelte";
     import { getCurrentUser } from "#lib/current_user.svelte";
@@ -22,6 +23,7 @@
     const api = new KeycastApi();
     const user = $derived(getCurrentUser()?.user);
     let status: StatusResponse | null = $state(null);
+    let isOperator = $state<boolean | null>(null);
     let isLoading = $state(true);
     let isSaving = $state(false);
     let loadError = $state<string | null>(null);
@@ -48,13 +50,15 @@
      * an operator would otherwise be blocked by a rotated identity with no way to
      * see or re-trust the new one.
      */
-    async function loadReplyIdentity() {
-        if (!user?.pubkey) return;
+    async function loadReplyIdentity(): Promise<boolean> {
+        if (!user?.pubkey) return false;
         replyIdentityError = null;
         try {
             const config = await api.get<{
+                is_operator?: unknown;
                 management_reply_public_key?: unknown;
             }>("/config", { params: { pubkey: user.pubkey } });
+            isOperator = config.is_operator === true;
             publishedReplyKey = isManagementReplyKey(
                 config.management_reply_public_key,
             )
@@ -64,12 +68,14 @@
                 replyIdentityError =
                     "The signer did not publish a management reply identity.";
             }
+            return isOperator;
         } catch (error) {
             publishedReplyKey = null;
             replyIdentityError =
                 error instanceof Error
                     ? error.message
                     : "Could not load the management reply identity";
+            return false;
         }
     }
 
@@ -80,18 +86,41 @@
         toast.success("Management reply identity trusted");
     }
 
+    let refreshGeneration = 0;
+
     async function refreshAll() {
-        await Promise.all([refresh(), loadReplyIdentity()]);
+        const gen = ++refreshGeneration;
+        const operator = await loadReplyIdentity();
+        if (gen !== refreshGeneration) return;
+        if (operator) {
+            await refresh(gen);
+        } else {
+            status = null;
+            loadError = null;
+            isLoading = false;
+        }
     }
 
     $effect(() => {
         if (user?.pubkey) {
-            void refresh();
-            void loadReplyIdentity();
+            void refreshAll();
         }
+        return () => {
+            refreshGeneration += 1;
+        };
     });
 
-    async function refresh() {
+    function normalizeRelayKey(url: string): string {
+        try {
+            const parsed = new URL(url.trim());
+            const path = parsed.pathname === "/" ? "" : parsed.pathname.replace(/\/+$/, "");
+            return `${parsed.protocol.toLowerCase()}//${parsed.host.toLowerCase()}${path}${parsed.search}`;
+        } catch {
+            return url.trim().toLowerCase().replace(/\/+$/, "");
+        }
+    }
+
+    async function refresh(gen = ++refreshGeneration) {
         if (!user?.pubkey) return;
         isLoading = true;
         loadError = null;
@@ -101,9 +130,11 @@
                 "GET",
                 user.pubkey,
             );
-            status = await api.get<StatusResponse>("/status", {
+            const loaded = await api.get<StatusResponse>("/status", {
                 headers: { Authorization: authorization },
             });
+            if (gen !== refreshGeneration) return;
+            status = loaded;
             minimumConnectedRelays = status.minimum_connected_relays;
             autoActivate = status.auto_activate_relays;
             relayLines = status.relays
@@ -111,13 +142,16 @@
                 .map((relay) => relay.url)
                 .join("\n");
         } catch (error) {
+            if (gen !== refreshGeneration) return;
             loadError =
                 error instanceof Error
                     ? error.message
                     : "Could not load status";
             toast.error(loadError);
         } finally {
-            isLoading = false;
+            if (gen === refreshGeneration) {
+                isLoading = false;
+            }
         }
     }
 
@@ -153,9 +187,20 @@
             .map((url) => url.trim())
             .filter(Boolean)
             .map((url) => ({ url, enabled: true }));
+        const enabledKeys = new Set(relays.map((v) => normalizeRelayKey(v.url)));
         const body = {
             minimum_connected_relays: minimumConnectedRelays,
-            relays: [...relays, ...(status?.relays ?? []).filter(r => !r.discovered && !r.enabled && !relays.some(v => v.url === r.url)).map(r => ({url:r.url,enabled:false}))],
+            relays: [
+                ...relays,
+                ...(status?.relays ?? [])
+                    .filter(
+                        (r) =>
+                            !r.discovered &&
+                            !r.enabled &&
+                            !enabledKeys.has(normalizeRelayKey(r.url)),
+                    )
+                    .map((r) => ({ url: r.url, enabled: false })),
+            ],
         };
         isSaving = true;
         try {
@@ -191,11 +236,12 @@
         </p>
     </div>
     <button
-        class="button button-secondary button-icon"
+        type="button"
+        class="button button-secondary"
         onclick={refreshAll}
         disabled={isLoading}
     >
-        <ArrowClockwise size="20" /> Refresh
+        <ArrowClockwise size={14} /> Refresh
     </button>
 </div>
 
@@ -204,23 +250,28 @@
     </p>{/if}
 
 <div class="card mb-5" class:border-warning={replyKeyChanged}>
-    <h2 class="text-xl font-bold mb-2">Management reply identity</h2>
+    <h2 class="text-base font-semibold">Management reply identity</h2>
     {#if replyIdentityError}
         <p class="input-error">{replyIdentityError}</p>
     {:else}
-        <p class="description">
-            Published by the signer: <code
-                >{publishedReplyKey
-                    ? managementReplyFingerprint(publishedReplyKey)
-                    : "loading"}</code
+        <p class="description flex flex-wrap items-center gap-2">
+            <span>Published by the signer:</span>
+            <code class="break-all select-all"
+                >{publishedReplyKey ?? "loading"}</code
             >
+            {#if publishedReplyKey}
+                <Copy value={publishedReplyKey} size="13" label="Copy published reply identity" />
+                <span class="text-xs font-mono text-muted">({managementReplyFingerprint(publishedReplyKey)})</span>
+            {/if}
         </p>
-        <p class="description">
-            Trusted by this browser: <code
-                >{pinnedReplyKey
-                    ? managementReplyFingerprint(pinnedReplyKey)
-                    : "nothing pinned yet"}</code
+        <p class="description flex flex-wrap items-center gap-2">
+            <span>Trusted by this browser:</span>
+            <code class="break-all select-all"
+                >{pinnedReplyKey ?? "nothing pinned yet"}</code
             >
+            {#if pinnedReplyKey}
+                <Copy value={pinnedReplyKey} size="13" label="Copy pinned reply identity" />
+            {/if}
         </p>
     {/if}
     {#if replyKeyChanged}
@@ -230,13 +281,24 @@
             <code>management_reply_public_key</code>. Trust the new identity only
             if you rotated the root credential yourself.
         </p>
-        <button class="button button-danger mt-3" onclick={trustReplyKey}
+        <button type="button" class="button button-danger self-start mt-3" onclick={trustReplyKey}
             >Trust this identity</button
         >
     {/if}
 </div>
 
-{#if isLoading && !status}
+{#if isOperator === false}
+    <div class="card mb-5">
+        <h2 class="text-sm font-semibold">Server administration</h2>
+        <p class="description">
+            Signer diagnostics, relay pool configuration, and NIP-65 auto-activation require an instance operator listed in
+            <code>KEYCAST_OPERATOR_PUBKEYS</code> on the host. Team admins still use the Management reply identity card above to verify or re-trust the signer after a root rotation.
+        </p>
+        <div>
+            <a href="/teams" class="button button-secondary">Back to workspace</a>
+        </div>
+    </div>
+{:else if isLoading && !status}
     <Loader />
 {:else if status}
     <div class="grid md:grid-cols-3 gap-3 mb-5">
@@ -322,21 +384,21 @@
     </div>
 
     <div class="card mb-5">
-        <h2 class="text-xl font-bold mb-4">Relay health</h2>
-        <p class="description mb-2">
+        <h2 class="text-base font-semibold">Relay health</h2>
+        <p class="description">
             Expand a relay for connection details and recent history.
         </p>
         {#each status.relays as relay (relay.id)}<RelayHealthRow
                 {relay}
             />
             {#if relay.discovered && relay.enabled}
-                <button class="button button-secondary mb-3" disabled={isSaving} onclick={() => disableDiscovered(relay.url)}>Disable discovered relay</button>
+                <button type="button" class="button button-secondary self-start mb-3" disabled={isSaving} onclick={() => disableDiscovered(relay.url)}>Disable discovered relay</button>
             {/if}
         {/each}
     </div>
 
     <div class="card mb-5">
-        <h2 class="text-xl font-bold mb-3">Diagnostics</h2>
+        <h2 class="text-base font-semibold">Diagnostics</h2>
         <div class="grid sm:grid-cols-2 gap-2 text-sm text-muted">
             <p>
                 Credential fingerprint: <code
@@ -349,14 +411,14 @@
         </div>
     </div>
 
-    <section class="border border-border p-5 mb-6">
-        <h2 class="text-xl font-bold mb-3">Relay discovery</h2>
+    <section class="card mb-5">
+        <h2 class="text-base font-semibold">Relay discovery</h2>
         <label class="flex items-center gap-3 mb-3">
             <input type="checkbox" bind:checked={autoActivate} />
             Activate compatible public relays from imported keys’ NIP-65 lists
         </label>
         <p class="text-muted text-sm mb-4">Lists are cached and refreshed in the background. Each key can add up to four signing relays, within the instance limit of twenty. Relays must pass a signing-transport check. Turning this off stops new activation; existing routes stay available for connected clients.</p>
-        <button class="button button-secondary" onclick={saveDiscovery} disabled={isSaving}>Save discovery policy</button>
+        <button type="button" class="button button-secondary self-start" onclick={saveDiscovery} disabled={isSaving}>Save discovery policy</button>
         <p class="text-muted text-sm mt-4">Cached retries: {status.signer.cached_retries} · coalesced: {status.signer.retry_coalesced} · throttled: {status.signer.retry_throttled} · storage rejections: {status.signer.storage_rejections}</p>
     </section>
     <form
@@ -367,8 +429,8 @@
         }}
     >
         <div>
-            <h2 class="text-xl font-bold">Relay configuration</h2>
-            <p class="text-sm text-muted">
+            <h2 class="text-base font-semibold">Relay configuration</h2>
+            <p class="description mt-1">
                 One WebSocket URL per line. Saving replaces the enabled relay
                 set.
             </p>

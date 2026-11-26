@@ -55,11 +55,41 @@ export type TeamWithRelations = {
     policies: Policy[];
 };
 
+export type InvitationStatus = {
+    id: number;
+    expires_at: number;
+};
+
+export type InvitationDetail = {
+    id: number;
+    created_at: number;
+    expires_at: number;
+    consumed_at: number | null;
+    revoked_at: number | null;
+    claimed_by_client_public_key: string | null;
+    status: "claimable" | "claimed" | "expired" | "revoked";
+};
+
+export type SessionStatus = {
+    id: number;
+    invitation_id: number;
+    client_public_key: string;
+    client_metadata: { name?: string; url?: string; image?: string } | null;
+    requested_capabilities: string[] | null;
+    connected_at: number;
+    last_seen_at: number;
+    ended_at: number | null;
+    end_reason: "logout" | "revoked" | "expired" | "replaced" | null;
+};
+
 export type Grant = {
     id: number;
     team_id: number;
     stored_key_id: number;
+    stored_key_name?: string;
+    stored_key_public_key?: string;
     policy_id: number;
+    policy_name?: string;
     name: string;
     remote_signer_public_key: string;
     expires_at: number | null;
@@ -68,7 +98,10 @@ export type Grant = {
     updated_at: number;
     active_sessions: number;
     claimable_invitations: number;
-    invitations: { id: number; expires_at: number }[];
+    invitations: InvitationStatus[];
+    recent_invitations?: InvitationDetail[];
+    sessions?: SessionStatus[];
+    recent_drops?: number;
 };
 
 export type KeyRelayInfo = {
@@ -108,7 +141,6 @@ export type SignerStatus = {
     active_grants: number;
     active_sessions: number;
     claimable_invitations: number;
-    invitations: { id: number; expires_at: number }[];
     enabled_relays: number;
     connected_relays: number;
     last_processed_at: number | null;
@@ -182,6 +214,7 @@ export type StatusResponse = {
 export type AuditEvent = {
     id: number;
     occurred_at: number;
+    stored_key_id: number | null;
     grant_id: number | null;
     session_id: number | null;
     actor_public_key: string | null;
@@ -189,4 +222,28 @@ export type AuditEvent = {
     outcome: "allowed" | "denied" | "succeeded" | "failed";
     reason_code: string | null;
     request_event_id: string | null;
+    details: Record<string, unknown>;
+};
+
+export type GrantDiagnosticEvent = {
+    id: number;
+    occurred_at: number;
+    team_id: number;
+    stored_key_id: number;
+    grant_id: number;
+    client_public_key: string | null;
+    event_id: string | null;
+    method: string | null;
+    outcome: "dropped";
+    reason_code: string;
+    relay_url: string | null;
+    details: Record<string, unknown>;
+};
+
+export type PublicConfig = {
+    pubkey_allowed: boolean;
+    is_operator: boolean;
+    instance_id: string;
+    authority_revision: number;
+    management_reply_public_key: string;
 };

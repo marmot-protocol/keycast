@@ -195,18 +195,18 @@
     .section-heading:first-child { margin-top: 0; }
     h3 { font-size: 14px; font-weight: 600; }
     .use-case-picker { position: relative; }
-    .use-case-menu { position: absolute; top: calc(100% + 6px); left: 0; right: 0; z-index: 20; background: var(--color-surface); border: 1px solid var(--color-line); box-shadow: 0 8px 24px #0006; }
+    .use-case-menu { position: absolute; top: calc(100% + 6px); left: 0; right: 0; z-index: 20; background: #161b22; border: 1px solid var(--line-strong); border-radius: 8px; box-shadow: 0 14px 36px rgba(0, 0, 0, 0.5); }
     .use-case-menu[hidden] { display: none; }
     .menu-heading { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 10px 14px; border-bottom: 1px solid var(--color-line); }
     .use-case-options { max-height: 320px; overflow-y: auto; overscroll-behavior: contain; padding: 0 14px 10px; }
-    .category-label { padding: 14px 0 5px; font-size: 12px; font-weight: 600; color: var(--color-muted); }
+    .category-label { padding: 14px 0 5px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--color-muted); }
     .option-row, .capability-row { display: flex; align-items: center; gap: 12px; padding: 12px 0; cursor: pointer; }
     .option-row { border-bottom: 1px solid var(--color-line); }
-    .option-row:hover { background: var(--color-canvas); }
+    .option-row:hover { background: rgba(255, 255, 255, 0.025); }
     input[type="checkbox"] { flex-shrink: 0; }
     .option-copy { display: grid; gap: 3px; min-width: 0; }
-    .option-title, .capability-name { color: var(--color-ink); font-size: 14px; }
-    .permission-group { margin-top: 10px; border: 1px solid var(--color-line); background: var(--color-surface); }
+    .option-title, .capability-name { color: var(--color-ink); font-size: 13px; font-weight: 500; }
+    .permission-group { margin-top: 10px; border: 1px solid var(--color-line); border-radius: 8px; background: rgba(255, 255, 255, 0.02); }
     .permission-group > summary { padding: 14px; font-size: 14px; }
     .group-body { padding: 0 14px 14px; }
     .group-heading, .individual-row { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 8px 0; }

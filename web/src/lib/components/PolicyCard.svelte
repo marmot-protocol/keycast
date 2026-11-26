@@ -1,15 +1,18 @@
 <script lang="ts">
-    import type { Policy } from "#lib/types";
+    import type { Grant, Policy } from "#lib/types";
+    import { policyCapabilityChips } from "#lib/utils/diagnostics";
     import { PencilSimple, Trash } from "phosphor-svelte";
 
     let {
         policy,
+        usedByGrants = [],
         hoverable = false,
         editHref,
         onRemove,
         onEdit,
     }: {
         policy: Policy;
+        usedByGrants?: Grant[];
         hoverable?: boolean;
         editHref?: string;
         onEdit?: (policy: Policy) => void;
@@ -28,65 +31,68 @@
         }
     }
 
-    const descriptions = $derived.by(() => {
-        const capabilities = policy.document?.capabilities;
-        if (
-            !capabilities ||
-            typeof capabilities !== "object" ||
-            Array.isArray(capabilities)
-        ) {
-            return ["Unknown policy document; all requests are denied."];
-        }
-        const values: string[] = [];
-        if (capabilities.sign_event) {
-            values.push(
-                `Sign event kinds: ${(capabilities.sign_event.allowed_kinds ?? []).join(", ")}`,
-            );
-        }
-        for (const method of [
-            "nip04_encrypt",
-            "nip04_decrypt",
-            "nip44_encrypt",
-            "nip44_decrypt",
-        ] as const) {
-            const capability = capabilities[method];
-            if (capability) {
-                values.push(
-                    `${method}: ${capability.recipient === "any" ? "any counterparty" : "self only"}`,
-                );
-            }
-        }
-        return values;
-    });
+    const chips = $derived(policyCapabilityChips(policy));
+    const activeGrants = $derived(
+        usedByGrants.filter(
+            (g) =>
+                g.revoked_at === null &&
+                (g.expires_at === null || g.expires_at > Math.floor(Date.now() / 1000)),
+        ),
+    );
 </script>
 
 <div class={hoverable ? "hover-card" : ""}>
-    <div class="flex items-baseline justify-between gap-2">
-        <h3 class="text-sm font-semibold">{policy.name}</h3>
-        <span class="text-xs text-muted">rev {policy.revision}</span>
+    <div class="flex flex-wrap items-baseline justify-between gap-2">
+        <div class="flex items-center gap-2 flex-wrap">
+            <h3 class="text-sm font-semibold">{policy.name}</h3>
+            <span class="font-mono text-[11px] text-muted">rev {policy.revision}</span>
+        </div>
+        {#if usedByGrants.length > 0}
+            <span class="badge badge-neutral">
+                {activeGrants.length} active {activeGrants.length === 1 ? "connection" : "connections"}
+            </span>
+        {/if}
     </div>
-    <ul class="mt-2 space-y-1">
-        {#each descriptions as description}
-            <li class="text-xs text-muted">{description}</li>
+
+    <div class="chip-list mt-2">
+        {#each chips as chip}
+            <span class="kind-chip">{chip}</span>
+        {:else}
+            <span class="text-xs text-danger">
+                Unknown policy document; all requests are denied.
+            </span>
         {/each}
-    </ul>
+    </div>
+
+    {#if activeGrants.length > 0}
+        <p class="text-[11px] text-muted mt-2">
+            Used by: {activeGrants.map((g) => g.name).join(", ")}
+        </p>
+    {/if}
+
     {#if editHref || onEdit || onRemove}
-        <div class="flex flex-wrap gap-2 mt-2">
+        <div class="flex flex-wrap gap-2 mt-3">
             {#if onEdit}<button
                     type="button"
                     class="button button-secondary"
-                    onclick={() => onEdit?.(policy)}>Edit</button
-                >{/if}
+                    onclick={() => onEdit?.(policy)}
+                >
+                    <PencilSimple size={14} /> Edit
+                </button>{/if}
             {#if editHref}<a
                     href={editHref}
                     class="button button-secondary button-icon"
-                    ><PencilSimple size="18" /> Edit</a
+                    ><PencilSimple size={14} /> Edit</a
                 >{/if}
             {#if onRemove}<button
                     type="button"
                     class="button button-danger button-icon"
                     onclick={remove}
-                    disabled={busy}><Trash size="18" /> Delete</button
+                    disabled={busy || activeGrants.length > 0}
+                    title={activeGrants.length > 0
+                        ? "Revoke active connections using this policy before deleting it"
+                        : "Delete policy"}
+                    ><Trash size={14} /> Delete</button
                 >{/if}
         </div>
     {/if}
