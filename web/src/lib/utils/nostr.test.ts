@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import type { EventTemplate, NostrEvent } from "applesauce-core/helpers";
+import { NostrConnectSigner, PrivateKeySigner } from "applesauce-signers";
 import {
     buildNip46SigningPermissions,
     clearActiveSigner,
@@ -7,6 +8,8 @@ import {
     getActiveSignerSummary,
     npubForPubkey,
     normalizeBunkerUri,
+    resetInMemorySignerForTest,
+    restoreActiveSigner,
     setActiveSigner,
     signNostrEvent,
 } from "#lib/nostr";
@@ -56,6 +59,12 @@ describe("Nostr helper utilities", () => {
 
         expect(() => normalizeBunkerUri("nostrconnect://abc")).toThrow(
             "Paste a bunker:// remote signer connection string",
+        );
+        expect(() => normalizeBunkerUri("bunker://abc?relay=ws://evil.example")).toThrow(
+            "valid wss:// relay URLs",
+        );
+        expect(() => normalizeBunkerUri("bunker://abc")).toThrow(
+            "valid wss:// relay URLs",
         );
     });
 
@@ -112,6 +121,66 @@ describe("Nostr helper utilities", () => {
         await expect(signNostrEvent(authTemplate(), PUBKEY)).rejects.toThrow(
             "signed with a different pubkey",
         );
+    });
+
+    test("persists and restores a paired NIP-46 bunker session across reloads without re-sending secrets", async () => {
+        const store = new Map<string, string>();
+        const prevWindow = (globalThis as Record<string, unknown>).window;
+        (globalThis as Record<string, unknown>).window = {
+            sessionStorage: {
+                getItem: (key: string) => store.get(key) ?? null,
+                setItem: (key: string, value: string) => store.set(key, value),
+                removeItem: (key: string) => store.delete(key),
+            },
+        };
+        try {
+            const clientKey = new PrivateKeySigner();
+            const original = new NostrConnectSigner({
+                relays: ["wss://nos.lol"],
+                remote: OTHER_PUBKEY,
+                pubkey: PUBKEY,
+                signer: clientKey,
+                subscriptionMethod: () => ({ subscribe: () => ({ unsubscribe() {} }) }) as never,
+                publishMethod: async () => [],
+            });
+            original.isConnected = true;
+
+            setActiveSigner({
+                kind: "nostr-connect",
+                pubkey: PUBKEY,
+                signer: original,
+            });
+            expect(store.size).toBe(1);
+            // Must never store any bunker secret
+            const saved = [...store.values()][0];
+            expect(saved).not.toContain("bunkerSecret");
+
+            // Simulate page refresh: clear in-memory activeSigner while storage remains
+            resetInMemorySignerForTest();
+            expect(getActiveSignerSummary()).toBeNull();
+
+            // Mismatched pubkey is rejected
+            await expect(restoreActiveSigner(OTHER_PUBKEY)).resolves.toBe(false);
+            expect(getActiveSignerSummary()).toBeNull();
+
+            // Matching pubkey restores cleanly
+            await expect(restoreActiveSigner(PUBKEY)).resolves.toBe(true);
+            expect(getActiveSignerSummary()).toEqual({
+                kind: "nostr-connect",
+                pubkey: PUBKEY,
+            });
+
+            // Sign-out wipes persisted session
+            clearActiveSigner();
+            expect(store.size).toBe(0);
+            await expect(restoreActiveSigner(PUBKEY)).resolves.toBe(false);
+        } finally {
+            if (prevWindow === undefined) {
+                delete (globalThis as Record<string, unknown>).window;
+            } else {
+                (globalThis as Record<string, unknown>).window = prevWindow;
+            }
+        }
     });
 });
 

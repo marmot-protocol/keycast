@@ -4,6 +4,8 @@ import {
     clearActiveSigner,
     connectNostrConnectBunker,
     getExtensionUser,
+    logoutAndClearActiveSigner,
+    persistActiveSignerSession,
     type NostrUser,
 } from "#lib/nostr";
 import toast from "svelte-hot-french-toast";
@@ -27,6 +29,14 @@ export async function signin(
     return completeSignin(signedInUser);
 }
 
+function cookieAttributes(maxAge: number): string {
+    const secure =
+        typeof window !== "undefined" && window.location.protocol === "https:"
+            ? "; Secure"
+            : "";
+    return `max-age=${maxAge}; SameSite=Lax${secure}; path=/`;
+}
+
 export async function completeSignin(
     signedInUser: NostrUser | null,
 ): Promise<NostrUser | null> {
@@ -46,9 +56,10 @@ export async function completeSignin(
             toast.error("Your pubkey is not authorized");
             return null;
         }
-        const alreadySignedIn = !!getCurrentUser();
+        persistActiveSignerSession();
+        const alreadySignedIn = !!getCurrentUser()?.user;
         setCurrentUser(signedInUser.pubkey);
-        document.cookie = `keycastUserPubkey=${signedInUser.pubkey}; max-age=1209600; SameSite=Lax; Secure; path=/`;
+        document.cookie = `keycastUserPubkey=${signedInUser.pubkey}; ${cookieAttributes(1209600)}`;
         if (!alreadySignedIn) {
             toast.success("Signed in successfully");
         }
@@ -90,9 +101,9 @@ async function userFromSigninMethod(
  * Signs the user out.
  */
 export async function signout() {
-    clearActiveSigner();
+    await logoutAndClearActiveSigner();
     setCurrentUser(null);
-    document.cookie = "keycastUserPubkey=; max-age=0; SameSite=Lax; Secure; path=/";
+    document.cookie = `keycastUserPubkey=; ${cookieAttributes(0)}`;
     toast.success("Signed out");
     await goto("/", { invalidateAll: true });
 }

@@ -12,6 +12,7 @@
         type SigninMethod,
         type SigninOptions,
     } from "#lib/utils/auth";
+    import { toast } from "svelte-hot-french-toast";
     import {
         Browser,
         Check,
@@ -114,9 +115,14 @@
 
         try {
             const user = await connectSession.waitForUser(controller.signal);
+            // Detach before closeMenu() so closing the dialog does not cancel the newly promoted signer.
+            connectSession = null;
+            connectController = null;
             const signedInUser = await completeSignin(user);
             if (signedInUser) {
                 closeMenu();
+            } else {
+                connectUri = "";
             }
         } catch (error) {
             if (!controller.signal.aborted) {
@@ -153,20 +159,24 @@
     async function copyConnectUri() {
         if (!connectUri) return;
 
-        await navigator.clipboard.writeText(connectUri);
-        connectCopied = true;
-        setTimeout(() => {
-            connectCopied = false;
-        }, 1500);
+        try {
+            await navigator.clipboard.writeText(connectUri);
+            connectCopied = true;
+            setTimeout(() => {
+                connectCopied = false;
+            }, 1500);
+        } catch {
+            toast.error("Could not copy. Select and copy the link manually.");
+        }
     }
 </script>
 
 <button
     type="button"
     onclick={openMenu}
-    class="button button-primary button-icon"
+    class="button button-primary"
 >
-    <SignIn size="20" />
+    <SignIn size={16} />
     Sign in
 </button>
 
@@ -214,7 +224,7 @@
             </span>
         </button>
 
-        <div class="rounded-sm border border-line bg-white/[0.03] p-3">
+        <div class="rounded-lg border border-line bg-white/[0.02] p-3.5">
             <div class="mb-3 flex items-center gap-3">
                 <Cloud size="24" class="text-accent" />
                 <div>
