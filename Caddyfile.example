@@ -25,6 +25,12 @@ http://127.0.0.1:2020 {
 	}
 }
 
+# Explicit HTTP -> HTTPS redirect so Caddy redirects to public port 443 rather
+# than appending internal https_port 8443. ACME HTTP-01 challenges still work.
+http://{$DOMAIN} {
+	redir https://{$DOMAIN}{uri} permanent
+}
+
 {$DOMAIN} {
 	encode zstd gzip
 

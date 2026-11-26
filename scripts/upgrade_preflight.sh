@@ -45,11 +45,11 @@ env_value() {
 ALLOWED_PUBKEYS="${ALLOWED_PUBKEYS:-$(env_value ALLOWED_PUBKEYS)}"
 DOMAIN="${DOMAIN:-$(env_value DOMAIN)}"
 KEYCAST_OPERATOR_PUBKEYS="${KEYCAST_OPERATOR_PUBKEYS:-$(env_value KEYCAST_OPERATOR_PUBKEYS)}"
-# Must resolve exactly like ${KEYCAST_STATE_DIR:-./state} in the Compose files, or this
+# Must resolve exactly like ${KEYCAST_STATE_DIR:-.} in the Compose files, or this
 # would check and repair a stale copy while the containers mount another one.
 KEYCAST_STATE_DIR="${KEYCAST_STATE_DIR:-$(env_value KEYCAST_STATE_DIR)}"
 if [[ -z "$KEYCAST_STATE_DIR" ]]; then
-    STATE_DIR="$ROOT_DIR/state"
+    STATE_DIR="$ROOT_DIR"
 elif [[ "$KEYCAST_STATE_DIR" = /* ]]; then
     STATE_DIR="$KEYCAST_STATE_DIR"
 else
@@ -144,15 +144,34 @@ fi
 
 # Require both paths: without the directory guard, chmod fails under `set -e`
 # and the script exits before printing the collected failure summary.
+LEGACY_CHECKOUT_DB=false
 if [[ -d "$DATABASE_DIR/migrations" ]]; then
-    fail "$DATABASE_DIR contains tracked migrations/; set KEYCAST_STATE_DIR to a separate state directory (e.g. ./state or /srv/keycast)"
-elif [[ "$FIX_PERMISSIONS" == true && -f "$ROOT_KEY" && ! -L "$ROOT_KEY" && -d "$DATABASE_DIR" && ! -L "$DATABASE_DIR" ]]; then
-    chmod 700 "$DATABASE_DIR"
+    LEGACY_CHECKOUT_DB=true
+    warn "$DATABASE_DIR contains tracked migrations/; consider moving live state to an external KEYCAST_STATE_DIR (see docs/upgrading.md)"
+fi
+
+if [[ "$FIX_PERMISSIONS" == true && -f "$ROOT_KEY" && ! -L "$ROOT_KEY" && -d "$DATABASE_DIR" && ! -L "$DATABASE_DIR" ]]; then
     chmod 600 "$ROOT_KEY"
-    if chown -R "$KEYCAST_UID:$KEYCAST_GID" "$DATABASE_DIR" "$ROOT_KEY" 2>/dev/null; then
-        ok "container ownership and permissions updated"
+    if [[ "$LEGACY_CHECKOUT_DB" == true ]]; then
+        # Never chmod/chown tracked database/migrations/ in a legacy checkout layout.
+        legacy_files=("$ROOT_KEY")
+        shopt -s nullglob
+        for db_file in "$DATABASE_DIR"/keycast-v2.db*; do
+            legacy_files+=("$db_file")
+        done
+        shopt -u nullglob
+        if chown "$KEYCAST_UID:$KEYCAST_GID" "${legacy_files[@]}" 2>/dev/null; then
+            ok "container ownership and permissions updated for master.key and v2 database files"
+        else
+            fail "could not chown runtime files; retry with sudo"
+        fi
     else
-        fail "could not chown runtime files; retry with sudo"
+        chmod 700 "$DATABASE_DIR"
+        if chown -R "$KEYCAST_UID:$KEYCAST_GID" "$DATABASE_DIR" "$ROOT_KEY" 2>/dev/null; then
+            ok "container ownership and permissions updated"
+        else
+            fail "could not chown runtime files; retry with sudo"
+        fi
     fi
 elif [[ "$FIX_PERMISSIONS" == true ]]; then
     fail "cannot repair permissions until $ROOT_KEY and $DATABASE_DIR both exist"
@@ -166,7 +185,7 @@ else
             fail "master.key has mode ${root_mode:-unknown}, owner ${root_owner:-unknown} (expected 600, uid $KEYCAST_UID); re-run with --fix-permissions"
         fi
     fi
-    if [[ -d "$DATABASE_DIR" && ! -L "$DATABASE_DIR" ]]; then
+    if [[ "$LEGACY_CHECKOUT_DB" == false && -d "$DATABASE_DIR" && ! -L "$DATABASE_DIR" ]]; then
         db_mode="$(file_mode "$DATABASE_DIR")"
         db_owner="$(file_owner "$DATABASE_DIR")"
         if [[ "$db_mode" == "700" && "$db_owner" == "$KEYCAST_UID" ]]; then
@@ -174,6 +193,23 @@ else
         else
             fail "database directory has mode ${db_mode:-unknown}, owner ${db_owner:-unknown} (expected 700, uid $KEYCAST_UID); re-run with --fix-permissions"
         fi
+    elif [[ "$LEGACY_CHECKOUT_DB" == true && -f "$DATABASE_DIR/keycast-v2.db" ]]; then
+        db_file_owner="$(file_owner "$DATABASE_DIR/keycast-v2.db")"
+        if [[ "$db_file_owner" == "$KEYCAST_UID" ]]; then
+            ok "keycast-v2.db has owner $KEYCAST_UID"
+        else
+            fail "keycast-v2.db has owner ${db_file_owner:-unknown} (expected uid $KEYCAST_UID); re-run with --fix-permissions"
+        fi
+    fi
+fi
+
+if [[ -f "$ROOT_DIR/Caddyfile" ]]; then
+    if grep -qE '^[[:space:]]*http_port[[:space:]]+8080\b' "$ROOT_DIR/Caddyfile" \
+        && grep -qE '^[[:space:]]*https_port[[:space:]]+8443\b' "$ROOT_DIR/Caddyfile" \
+        && grep -q '/healthz' "$ROOT_DIR/Caddyfile"; then
+        ok "Caddyfile is configured for unprivileged ports 8080/8443 and /healthz"
+    else
+        fail "existing ./Caddyfile is missing unprivileged port (http_port 8080 / https_port 8443) or /healthz settings required by caddy-docker-compose-example.yml; see docs/upgrading.md"
     fi
 fi
 

@@ -74,12 +74,6 @@ signer_nets = set((services.get("keycast-signer") or {}).get("networks") or [])
 if signer_nets != {"keycast-signer-egress"}:
     errors.append(f"keycast-signer networks must be only keycast-signer-egress, got {sorted(signer_nets)}")
 
-for vol in (services.get("keycast-signer") or {}).get("volumes") or []:
-    if isinstance(vol, dict) and vol.get("target") == "/app/database":
-        src = str(vol.get("source", "")).rstrip("/")
-        if src.endswith("/database") and not src.endswith("/state/database") and src == os.path.join(os.getcwd(), "database"):
-            errors.append(f"keycast-signer default database mount must not bind tracked checkout database/: {src}")
-
 for isolated in ("keycast-api", "keycast-web"):
     svc = services.get(isolated) or {}
     nets = set(svc.get("networks") or [])

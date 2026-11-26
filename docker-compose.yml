@@ -42,11 +42,11 @@ services:
       target: signer-runtime
     volumes:
       # Set KEYCAST_STATE_DIR to keep persistent state and the root credential
-      # outside the checkout, e.g. /srv/keycast. Defaults to ./state so tracked
-      # ./database/migrations is never mounted writable into the signer.
-      - ${KEYCAST_STATE_DIR:-./state}/database:/app/database:rw
+      # outside tracked database/migrations (scripts/init.sh writes ./state by
+      # default). Omitting KEYCAST_STATE_DIR falls back to "." for existing upgrades.
+      - ${KEYCAST_STATE_DIR:-.}/database:/app/database:rw
       - keycast-runtime:/run/keycast:rw
-      - ${KEYCAST_STATE_DIR:-./state}/master.key:/run/secrets/keycast-root-key:ro
+      - ${KEYCAST_STATE_DIR:-.}/master.key:/run/secrets/keycast-root-key:ro
     environment:
       RUST_LOG: info,keycast_signer=info
       ALLOWED_PUBKEYS: "${ALLOWED_PUBKEYS:?error}"

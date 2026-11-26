@@ -63,13 +63,21 @@ if [[ -e .env || -L .env ]]; then
     echo "Error: .env already exists; refusing to overwrite it"
     exit 1
 fi
-# Must match ${KEYCAST_STATE_DIR:-./state} in the Compose files.
+# New installs default to ./state so tracked ./database/migrations is never touched.
 if [[ -z "$STATE_DIR_ARG" ]]; then
+    if [[ -e "$ROOT_DIR/master.key" || -e "$ROOT_DIR/database/keycast-v2.db" ]]; then
+        echo "Error: existing checkout state found ($ROOT_DIR/master.key or database/keycast-v2.db)."
+        echo "Do not re-initialize an existing instance; see docs/upgrading.md to upgrade or migrate state."
+        exit 1
+    fi
     STATE_DIR="$ROOT_DIR/state"
+    STATE_DIR_ENV="./state"
 elif [[ "$STATE_DIR_ARG" = /* ]]; then
     STATE_DIR="$STATE_DIR_ARG"
+    STATE_DIR_ENV="$STATE_DIR"
 else
     STATE_DIR="$ROOT_DIR/$STATE_DIR_ARG"
+    STATE_DIR_ENV="$STATE_DIR"
 fi
 DATABASE_DIR="$STATE_DIR/database"
 ROOT_KEY="$STATE_DIR/master.key"
@@ -95,9 +103,7 @@ fi
 
 {
     echo "DOMAIN=$DOMAIN"
-    if [[ "$STATE_DIR" != "$ROOT_DIR/state" ]]; then
-        echo "KEYCAST_STATE_DIR=$STATE_DIR"
-    fi
+    echo "KEYCAST_STATE_DIR=$STATE_DIR_ENV"
     echo "ALLOWED_PUBKEYS=$ALLOWED_PUBKEYS"
     echo "KEYCAST_OPERATOR_PUBKEYS=$OPERATOR_PUBKEYS"
     echo "KEYCAST_API_IMAGE=ghcr.io/marmot-protocol/keycast-api"

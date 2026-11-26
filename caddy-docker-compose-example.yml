@@ -12,6 +12,15 @@
 #   docker network create --internal keycast   # scripts/init.sh does this
 #   docker compose -f caddy-docker-compose-example.yml up -d
 #
+# Upgrading from an older root-owned Caddy proxy:
+#   1. Update ./Caddyfile with http_port 8080, https_port 8443, the explicit
+#      http://{$DOMAIN} redirect, and the 127.0.0.1:2020 /healthz block.
+#   2. Stop Caddy and transfer caddy_data/caddy_config ownership to 10001:10001:
+#      docker compose -f caddy-docker-compose-example.yml down
+#      docker compose -f caddy-docker-compose-example.yml run --rm --user 0 \
+#        --entrypoint sh caddy -c 'chown -R 10001:10001 /data /config'
+#   3. Start Caddy again: docker compose -f caddy-docker-compose-example.yml up -d
+#
 # Verify the pinned digest before trusting it:
 #   docker buildx imagetools inspect caddy:2.10-alpine
 
