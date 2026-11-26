@@ -20,7 +20,7 @@ use zeroize::Zeroizing;
 pub struct Store {
     pub pool: SqlitePool,
     pub cipher: EnvelopeCipher,
-    pub authority: std::sync::Arc<tokio::sync::RwLock<()>>,
+    pub authority: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
 
 #[derive(Debug, Clone)]
@@ -77,7 +77,7 @@ impl Store {
         Self {
             pool,
             cipher,
-            authority: std::sync::Arc::new(tokio::sync::RwLock::new(())),
+            authority: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 

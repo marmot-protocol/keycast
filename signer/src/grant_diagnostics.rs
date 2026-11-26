@@ -188,6 +188,7 @@ impl GrantDiagnostics {
         items
     }
 
+    #[cfg(test)]
     pub fn recent_count_for_grant(&self, team_id: i64, grant_id: i64) -> usize {
         let map = self.by_grant.lock().unwrap_or_else(|e| e.into_inner());
         map.get(&(team_id, grant_id)).map_or(0, VecDeque::len)

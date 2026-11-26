@@ -205,6 +205,17 @@ fn relay_result(
     }
 }
 
+struct WorkerOutcome {
+    inflight_key: String,
+    event_id: String,
+    relay: Option<String>,
+    target_hex: String,
+    peer: String,
+    recovered: bool,
+    session_active: Option<bool>,
+    result: Result<Option<nostr::prelude::Event>, ProtocolError>,
+}
+
 /// Shared by the daemon and real-relay integration tests.
 pub async fn relay_supervisor(
     state: RuntimeState,
@@ -251,6 +262,7 @@ pub async fn relay_supervisor(
     // Events from clients without a live session on the target grant, including
     // every `connect`, draw from their own smaller lane.
     let newcomers = Admission::new(Limits::NEWCOMER);
+    let established_verification = Admission::new(Limits::ESTABLISHED);
     let replay_validation = Admission::default();
     // (remote signer pubkey, client pubkey) pairs with a live session, refreshed
     // with the grant configuration. Bounded by the sessions capacity trigger.
@@ -336,13 +348,22 @@ pub async fn relay_supervisor(
                                 // addressed to a public remote-signer key must not be able to
                                 // exhaust the capacity that established sessions rely on.
                                 let target_hex = target.to_hex();
-                                let established = live_sessions.contains(&(target_hex.clone(), peer.clone()));
-                                if established && event.verify().is_err() {
-                                    // A rogue relay spoofing an established client pubkey with an
-                                    // invalid signature must not spend that session's ESTABLISHED budget
-                                    // or pollute its diagnostics buffer.
-                                    return Ok(true);
-                                }
+                                let established = if live_sessions.contains(&(target_hex.clone(), peer.clone())) {
+                                    // Bound signature verification itself on the supervisor loop so
+                                    // spoofed events carrying an established client pubkey cannot
+                                    // monopolize the single relay-supervisor task.
+                                    let Some(_verification) = established_verification.try_admit(&peer, &target_hex) else {
+                                        state.metrics.ingress_rejections.fetch_add(1, Ordering::Relaxed);
+                                        telemetry.record(relay_url.as_str(), "established_verify_throttled");
+                                        return Ok(true);
+                                    };
+                                    if event.verify().is_err() {
+                                        return Ok(true);
+                                    }
+                                    true
+                                } else {
+                                    false
+                                };
                                 let lane = if established {
                                     &admission
                                 } else {
@@ -353,9 +374,7 @@ pub async fn relay_supervisor(
                                     Err(reason) => {
                                         state.metrics.ingress_rejections.fetch_add(1,Ordering::Relaxed);
                                         telemetry.record(relay_url.as_str(), reason);
-                                        if (established || event.verify().is_ok())
-                                            && grant_targets.contains_key(&target_hex)
-                                        {
+                                        if established {
                                             if let Some(&(grant_id, team_id, stored_key_id)) = grant_targets.get(&target_hex) {
                                                 state.grant_diagnostics.record_drop(
                                                     team_id,
@@ -390,7 +409,16 @@ pub async fn relay_supervisor(
                                     } else {
                                         None
                                     };
-                                    (worker_key, id, Some(relay_str), target_hex, peer, false, session_active, result)
+                                    WorkerOutcome {
+                                        inflight_key: worker_key,
+                                        event_id: id,
+                                        relay: Some(relay_str),
+                                        target_hex,
+                                        peer,
+                                        recovered: false,
+                                        session_active,
+                                        result,
+                                    }
                                 });
                                 worker_events.insert(task.id(), inflight_key);
                             }
@@ -399,8 +427,17 @@ pub async fn relay_supervisor(
                     }
                 }
                 Some(result) = workers.join_next(), if !workers.is_empty() => {
-                    let (inflight_key, id, relay_opt, target_hex, peer, recovered, session_active, result) = match result {
-                        Ok(value) => { worker_events.retain(|_, key| key != &value.0); value },
+                    let WorkerOutcome {
+                        inflight_key,
+                        event_id: id,
+                        relay: relay_opt,
+                        target_hex,
+                        peer,
+                        recovered,
+                        session_active,
+                        result,
+                    } = match result {
+                        Ok(value) => { worker_events.retain(|_, key| key != &value.inflight_key); value },
                         Err(error) => {
                             if let Some(key) = worker_events.remove(&error.id()) {
                                 inflight.remove(&key);
@@ -614,7 +651,16 @@ pub async fn relay_supervisor(
                                 } else {
                                     None
                                 };
-                                (worker_key, id, None, target_hex, peer, true, session_active, result)
+                                WorkerOutcome {
+                                    inflight_key: worker_key,
+                                    event_id: id,
+                                    relay: None,
+                                    target_hex,
+                                    peer,
+                                    recovered: true,
+                                    session_active,
+                                    result,
+                                }
                             });
                             worker_events.insert(task.id(), inflight_key);
                         }

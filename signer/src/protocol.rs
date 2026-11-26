@@ -260,9 +260,9 @@ impl RequestProcessor {
             return Err(err);
         }
 
-        // Shared read lock allows concurrent NIP-46 workers while still blocking
-        // across management authority writes (policy updates, revocations).
-        let _authority = self.store.authority.read().await;
+        // Exclusive authority lock serializes request dedupe, execution, caching,
+        // and management mutations (decryption and parsing already ran unlocked above).
+        let _authority = self.store.authority.lock().await;
         let grant = self
             .store
             .grant_for_recipient(&remote_hex)
@@ -701,7 +701,7 @@ impl RequestProcessor {
         request_event_id: &str,
     ) -> Result<(), ProtocolError> {
         let response = {
-            let _authority = self.store.authority.read().await;
+            let _authority = self.store.authority.lock().await;
             let Some(json) = self.store.cached_session_response(request_event_id).await? else {
                 return Ok(());
             };

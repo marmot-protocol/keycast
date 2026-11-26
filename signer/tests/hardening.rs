@@ -990,7 +990,7 @@ async fn runtime_isolates_noisy_grant_before_waiting_for_authority() {
     let (stop, rx) = tokio::sync::watch::channel(false);
     let task = tokio::spawn(relay_supervisor(state.clone(), rx));
     ready(&state).await;
-    let authority = f.store.authority.write().await;
+    let authority = f.store.authority.lock().await;
     for n in 0..12 {
         let attacker = Keys::generate();
         let event = EventBuilder::new(Kind::NostrConnect, format!("invalid-{n}"))
@@ -1063,7 +1063,7 @@ async fn forged_flood_cannot_starve_a_client_that_already_holds_a_session() {
 
     // Hold the authority gate so admitted workers occupy their lane, then flood
     // from rotating keys the way an attacker on a shared relay would.
-    let authority = f.store.authority.write().await;
+    let authority = f.store.authority.lock().await;
     let before = state.metrics.ingress_rejections.load(Ordering::Relaxed);
     for n in 0..24 {
         let attacker = Keys::generate();
@@ -1804,7 +1804,7 @@ async fn completed_reconnect_backlog_does_not_reject_fresh_requests() {
     ready(&state).await;
     // Runtime restart loaded only durable IDs. Hold authority to keep the replay
     // workers busy while all thirteen old requests and a fresh one arrive.
-    let authority = f.store.authority.write().await;
+    let authority = f.store.authority.lock().await;
     for event in &requests {
         observer.send_event(event).await.unwrap();
     }
@@ -1914,4 +1914,102 @@ async fn relay_discovery_scopes_advertising_and_response_publication_to_owning_k
     client.shutdown().await;
     baseline.shutdown();
     scoped.shutdown();
+}
+
+#[tokio::test]
+async fn concurrent_duplicate_event_ids_execute_only_once() {
+    let f = Fixture::new("wss://relay.example").await;
+    let processor = f.processor();
+    processor.prepare_response(&f.connect()).await.unwrap();
+
+    // Two distinct valid Schnorr signatures for the exact same event ID.
+    let template = json!({
+        "kind": 1,
+        "content": "idempotent note",
+        "tags": [],
+        "created_at": Timestamp::now().as_secs()
+    })
+    .to_string();
+    let base = f.event("dup-1", "sign_event", vec![template]);
+    let mut second = base.clone();
+    // Re-sign the exact same unsigned fields with fresh Schnorr auxiliary randomness so id matches while sig differs.
+    let resigned = EventBuilder::new(base.kind, base.content.clone())
+        .tags(base.tags.clone())
+        .custom_created_at(base.created_at)
+        .finalize(&f.client)
+        .unwrap();
+    assert_eq!(base.id, resigned.id);
+    second.sig = resigned.sig;
+
+    let (first_res, second_res) = tokio::join!(
+        processor.prepare_response(&base),
+        processor.prepare_response(&second)
+    );
+    let first_reply = first_res.unwrap().unwrap();
+    let second_reply = second_res.unwrap().unwrap();
+    assert_eq!(first_reply.id, second_reply.id);
+    assert_eq!(f.decrypt(&first_reply), f.decrypt(&second_reply));
+
+    let audit_count: i64 = query_scalar(
+        "SELECT count(*) FROM audit_events WHERE action = 'nip46.sign_event' AND request_event_id = ?",
+    )
+    .bind(base.id.to_hex())
+    .fetch_one(&f.store.pool)
+    .await
+    .unwrap();
+    assert_eq!(audit_count, 1, "duplicate event ID must execute only once");
+}
+
+#[tokio::test]
+async fn newcomer_flood_past_rate_limit_does_not_record_unverified_diagnostics() {
+    let relay = LocalRelay::new();
+    relay.run().await.unwrap();
+    let f = Fixture::new(relay.url().await.as_str()).await;
+    let state = RuntimeState::new(f.store.clone());
+    let (stop, rx) = tokio::sync::watch::channel(false);
+    let supervisor = tokio::spawn(relay_supervisor(state.clone(), rx));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !state.ready.load(Ordering::Relaxed) && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(state.ready.load(Ordering::Relaxed));
+
+    // Flood 20 newcomer events (well past Limits::NEWCOMER per-grant rate of 8/s) from distinct keys.
+    let flooder = Client::new();
+    flooder.add_relay(relay.url().await).await.unwrap();
+    flooder.connect().and_wait(Duration::from_secs(2)).await;
+    for i in 0..20 {
+        let sender = Keys::generate();
+        let ev = EventBuilder::new(Kind::NostrConnect, format!("garbage-{i}"))
+            .tag(Tag::public_key(f.remote.public_key()))
+            .finalize(&sender)
+            .unwrap();
+        let _ = flooder.send_event(&ev).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert!(
+        state.metrics.ingress_rejections.load(Ordering::Relaxed) > 0,
+        "newcomer flood should trigger admission rejections"
+    );
+    let team_id: i64 = query_scalar("SELECT team_id FROM grants WHERE id = ?")
+        .bind(f.grant)
+        .fetch_one(&f.store.pool)
+        .await
+        .unwrap();
+    let rate_limited_drops = state
+        .grant_diagnostics
+        .list_for_team(team_id)
+        .into_iter()
+        .filter(|d| d.reason_code == "rate_limited")
+        .count();
+    assert_eq!(
+        rate_limited_drops, 0,
+        "rejected newcomers must not be verified or recorded as rate_limited diagnostics"
+    );
+
+    stop.send(true).unwrap();
+    supervisor.await.unwrap().unwrap();
+    flooder.shutdown().await;
+    relay.shutdown();
 }

@@ -147,7 +147,7 @@ pub async fn auth_middleware(
         );
     }
     // Serializes original approval, ACL checks and mutation with NIP-46 admission.
-    let _authority = state.signer.runtime.store.authority.write().await;
+    let _authority = state.signer.runtime.store.authority.lock().await;
     let context: Result<(String, i64), _> = sqlx::query_as::query_as(
         "SELECT instance_id, authority_revision FROM instance_settings WHERE singleton=1",
     )
