@@ -16,6 +16,7 @@ export function getCurrentUser(): CurrentUser | null {
 }
 
 export function setCurrentUser(pubkey: string | null): CurrentUser | null {
-    currentUser = pubkey ? new CurrentUser(pubkey) : null;
+    const user = pubkey ? userFromPubkey(pubkey) : null;
+    currentUser = user ? new CurrentUser(user.pubkey) : null;
     return currentUser;
 }

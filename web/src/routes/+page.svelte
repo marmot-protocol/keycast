@@ -18,8 +18,7 @@
     <section class="landing-hero" aria-labelledby="welcome-title">
         <div>
             <p class="landing-prompt">
-                <span aria-hidden="true">&gt; </span>your keys, your
-                infrastructure
+                Your keys, your infrastructure
             </p>
             <h1 class="landing-title" id="welcome-title">
                 Your keys.<br /><span>Under your control.</span>
@@ -64,14 +63,14 @@
     </section>
     <section class="landing-notes" aria-label="How access works">
         <article>
-            <h2>keys stay with the signer</h2>
+            <h2>Keys stay with the signer</h2>
             <p>
                 Apps request signatures through NIP-46. They do not receive the
                 managed private key.
             </p>
         </article>
         <article>
-            <h2>you approve management changes</h2>
+            <h2>You approve management changes</h2>
             <p>
                 Sign in with a browser extension or remote signer. Keep
                 management approvals in your external key store.

@@ -317,7 +317,7 @@ impl Store {
         let actor_public_key = PublicKey::from_hex(actor_public_key)?.to_hex();
         let mut transaction = self.pool.begin().await?;
         let revoked: Option<(i64, i64)> = query_as(
-            "UPDATE grants SET revoked_at = unixepoch(), updated_at = unixepoch()
+            "UPDATE grants SET revoked_at = max(unixepoch(), created_at), updated_at = max(unixepoch(), created_at)
              WHERE id = ? AND revoked_at IS NULL RETURNING team_id, stored_key_id",
         )
         .bind(grant_id)
@@ -325,14 +325,14 @@ impl Store {
         .await?;
         let (team_id, stored_key_id) = revoked.ok_or(StoreError::NotFound)?;
         query(
-            "UPDATE invitations SET revoked_at = unixepoch()
+            "UPDATE invitations SET revoked_at = max(unixepoch(), created_at)
              WHERE grant_id = ? AND consumed_at IS NULL AND revoked_at IS NULL",
         )
         .bind(grant_id)
         .execute(&mut *transaction)
         .await?;
         query(
-            "UPDATE sessions SET ended_at = unixepoch(), end_reason = 'revoked'
+            "UPDATE sessions SET ended_at = max(unixepoch(), connected_at), end_reason = 'revoked'
              WHERE grant_id = ? AND ended_at IS NULL",
         )
         .bind(grant_id)
@@ -362,7 +362,7 @@ impl Store {
         let actor_public_key = PublicKey::from_hex(actor_public_key)?.to_hex();
         let mut transaction = self.pool.begin().await?;
         let grant_id: Option<i64> = query_scalar(
-            "UPDATE invitations SET revoked_at = unixepoch()
+            "UPDATE invitations SET revoked_at = max(unixepoch(), created_at)
              WHERE id = ? AND consumed_at IS NULL AND revoked_at IS NULL RETURNING grant_id",
         )
         .bind(invitation_id)
@@ -480,7 +480,7 @@ impl Store {
             "INSERT INTO relay_checkpoints(
                 relay_id, last_event_created_at, last_event_id, last_received_at,
                 consecutive_failures, last_error
-             ) SELECT id, ?, ?, unixepoch(), 0, NULL FROM relays WHERE url = ?
+             ) SELECT id, ?, ?, unixepoch(), 0, NULL FROM relays WHERE rtrim(url, '/') = rtrim(?, '/')
              ON CONFLICT(relay_id) DO UPDATE SET
                 last_event_created_at = excluded.last_event_created_at,
                 last_event_id = excluded.last_event_id,
@@ -499,7 +499,7 @@ impl Store {
         query(
             "INSERT INTO relay_checkpoints(
                 relay_id, last_published_at, consecutive_failures, last_error
-             ) SELECT id, unixepoch(), 0, NULL FROM relays WHERE url = ?
+             ) SELECT id, unixepoch(), 0, NULL FROM relays WHERE rtrim(url, '/') = rtrim(?, '/')
              ON CONFLICT(relay_id) DO UPDATE SET
                 last_published_at = unixepoch(), consecutive_failures = 0,
                 last_error = NULL, updated_at = unixepoch()",
@@ -583,6 +583,45 @@ impl Store {
         }))
     }
 
+    pub async fn has_active_session_for_pair(
+        &self,
+        remote_pubkey: &str,
+        client_pubkey: &str,
+    ) -> Result<bool, StoreError> {
+        Ok(query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM sessions s
+                JOIN grants g ON g.id = s.grant_id
+                WHERE g.remote_signer_public_key = ?
+                  AND s.client_public_key = ?
+                  AND s.ended_at IS NULL
+                  AND g.revoked_at IS NULL
+                  AND (g.expires_at IS NULL OR g.expires_at > unixepoch())
+             )",
+        )
+        .bind(remote_pubkey)
+        .bind(client_pubkey)
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
+    pub async fn fail_pending_input(&self, event_id: &str, reason: &str) -> Result<(), StoreError> {
+        query(
+            "UPDATE processed_requests
+             SET status = 'failed',
+                 reason_code = ?,
+                 request_event_json = NULL,
+                 reserved_response_bytes = 0,
+                 completed_at = max(unixepoch(), received_at)
+             WHERE event_id = ? AND status = 'processing' AND response_event_json IS NULL",
+        )
+        .bind(reason)
+        .bind(event_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Cheap pre-admission check prevents unknown clients filling the durable inbox.
     pub async fn can_connect(
         &self,
@@ -593,6 +632,61 @@ impl Store {
         let hash = Sha256::digest(secret.as_bytes());
         Ok(query_scalar("SELECT EXISTS(SELECT 1 FROM invitations i WHERE i.grant_id=? AND i.secret_hash=? AND ((i.consumed_at IS NULL AND i.revoked_at IS NULL AND i.expires_at>unixepoch()) OR EXISTS(SELECT 1 FROM sessions s WHERE s.invitation_id=i.id AND s.client_public_key=? AND s.ended_at IS NULL)))")
             .bind(grant).bind(hash.as_slice()).bind(client.to_hex()).fetch_one(&self.pool).await?)
+    }
+
+    /// Classify why a pre-admission `connect` was rejected so operators can
+    /// troubleshoot without exposing secrets or writing unauthenticated spam to SQLite.
+    pub async fn diagnose_connect_rejection(
+        &self,
+        grant_id: i64,
+        secret: &str,
+    ) -> Result<(&'static str, serde_json::Value), StoreError> {
+        if secret.is_empty() {
+            return Ok(("secret_missing", serde_json::json!({})));
+        }
+        let supplied_hash = Sha256::digest(secret.as_bytes());
+        let matched: Option<(i64, Option<i64>, Option<i64>, i64)> = query_as(
+            "SELECT id, consumed_at, revoked_at, expires_at
+             FROM invitations WHERE grant_id = ? AND secret_hash = ? LIMIT 1",
+        )
+        .bind(grant_id)
+        .bind(supplied_hash.as_slice())
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some((invitation_id, consumed_at, revoked_at, expires_at)) = matched else {
+            return Ok(("secret_mismatch", serde_json::json!({})));
+        };
+        if consumed_at.is_some() {
+            let claimed_by: Option<String> = query_scalar(
+                "SELECT client_public_key FROM sessions WHERE invitation_id = ? LIMIT 1",
+            )
+            .bind(invitation_id)
+            .fetch_optional(&self.pool)
+            .await?;
+            return Ok((
+                "secret_already_consumed",
+                serde_json::json!({
+                    "invitation_id": invitation_id,
+                    "claimed_by_client_public_key": claimed_by,
+                }),
+            ));
+        }
+        if revoked_at.is_some() {
+            return Ok((
+                "secret_revoked",
+                serde_json::json!({ "invitation_id": invitation_id }),
+            ));
+        }
+        if expires_at <= chrono::Utc::now().timestamp() {
+            return Ok((
+                "secret_expired",
+                serde_json::json!({ "invitation_id": invitation_id }),
+            ));
+        }
+        Ok((
+            "invitation_not_claimable",
+            serde_json::json!({ "invitation_id": invitation_id }),
+        ))
     }
 
     pub async fn claim_invitation(
@@ -652,7 +746,7 @@ impl Store {
             };
 
             query(
-                "UPDATE sessions SET ended_at = unixepoch(), end_reason = 'replaced'
+                "UPDATE sessions SET ended_at = max(unixepoch(), connected_at), end_reason = 'replaced'
                  WHERE grant_id = ? AND client_public_key = ? AND ended_at IS NULL",
             )
             .bind(grant.id)
@@ -660,7 +754,7 @@ impl Store {
             .execute(&mut *connection)
             .await?;
             let consumed = query(
-                "UPDATE invitations SET consumed_at = unixepoch()
+                "UPDATE invitations SET consumed_at = max(unixepoch(), created_at)
                  WHERE id = ? AND consumed_at IS NULL AND revoked_at IS NULL
                    AND expires_at > unixepoch()",
             )
@@ -800,6 +894,7 @@ impl Store {
         Ok(reclaimed.rows_affected() == 1)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn cache_response(
         &self,
         event_id: &str,
@@ -807,12 +902,14 @@ impl Store {
         response_json: &str,
         approved: bool,
         reason: Option<&str>,
+        details_json: &str,
         logout: bool,
     ) -> Result<(), StoreError> {
         let mut tx = self.pool.begin().await?;
         query(
             "UPDATE processed_requests SET session_id = ?, status = ?, reason_code = ?,
-                    response_event_json = ?, reserved_response_bytes=0, completed_at = unixepoch()
+                    response_event_json = ?, reserved_response_bytes=0,
+                    completed_at = max(unixepoch(), received_at)
              WHERE event_id = ?",
         )
         .bind(session_id)
@@ -822,11 +919,11 @@ impl Store {
         .bind(event_id)
         .execute(&mut *tx)
         .await?;
-        query("INSERT INTO audit_events(team_id,stored_key_id,grant_id,session_id,actor_public_key,action,outcome,reason_code,request_event_id)
-            SELECT g.team_id,g.stored_key_id,g.id,r.session_id,r.client_public_key,'nip46.'||r.method,?,r.reason_code,r.event_id FROM processed_requests r JOIN grants g ON g.id=r.grant_id WHERE r.event_id=?")
-            .bind(if approved {"allowed"} else {"denied"}).bind(event_id).execute(&mut *tx).await?;
+        query("INSERT INTO audit_events(team_id,stored_key_id,grant_id,session_id,actor_public_key,action,outcome,reason_code,request_event_id,details)
+            SELECT g.team_id,g.stored_key_id,g.id,r.session_id,r.client_public_key,'nip46.'||r.method,?,r.reason_code,r.event_id,? FROM processed_requests r JOIN grants g ON g.id=r.grant_id WHERE r.event_id=?")
+            .bind(if approved {"allowed"} else {"denied"}).bind(details_json).bind(event_id).execute(&mut *tx).await?;
         if logout {
-            query("UPDATE sessions SET ended_at=unixepoch(),end_reason='logout' WHERE id=? AND ended_at IS NULL").bind(session_id).execute(&mut *tx).await?;
+            query("UPDATE sessions SET ended_at=max(unixepoch(),connected_at),end_reason='logout' WHERE id=? AND ended_at IS NULL").bind(session_id).execute(&mut *tx).await?;
         }
         tx.commit().await?;
         Ok(())
@@ -965,7 +1062,7 @@ impl Store {
         Ok(())
     }
     pub async fn maintenance(&self) -> Result<(), StoreError> {
-        query("UPDATE sessions SET ended_at=unixepoch(),end_reason='expired' WHERE ended_at IS NULL AND grant_id IN (SELECT id FROM grants WHERE expires_at<=unixepoch())").execute(&self.pool).await?;
+        query("UPDATE sessions SET ended_at=max(unixepoch(),connected_at),end_reason='expired' WHERE ended_at IS NULL AND grant_id IN (SELECT id FROM grants WHERE expires_at<=unixepoch())").execute(&self.pool).await?;
 
         query("DELETE FROM audit_events WHERE id IN (SELECT id FROM audit_events WHERE occurred_at<unixepoch()-2592000 ORDER BY occurred_at LIMIT 500)").execute(&self.pool).await?;
         query("DELETE FROM management_nonces WHERE accepted_at<unixepoch()-600")
@@ -973,6 +1070,10 @@ impl Store {
             .await?;
         query("DELETE FROM invitations WHERE id IN (SELECT id FROM invitations WHERE expires_at<unixepoch()-2592000 AND NOT EXISTS(SELECT 1 FROM sessions WHERE invitation_id=invitations.id) LIMIT 500)").execute(&self.pool).await?;
         query("DELETE FROM sessions WHERE id IN (SELECT id FROM sessions WHERE ended_at<unixepoch()-2592000 LIMIT 500)").execute(&self.pool).await?;
+        // Prune long-revoked or long-expired grants and unreferenced soft-deleted policies
+        // so historical tombstones cannot permanently exhaust the 1,000-row capacity triggers.
+        query("DELETE FROM grants WHERE id IN (SELECT id FROM grants WHERE (revoked_at<unixepoch()-2592000 OR (expires_at IS NOT NULL AND expires_at<unixepoch()-2592000)) AND NOT EXISTS(SELECT 1 FROM sessions WHERE grant_id=grants.id) AND NOT EXISTS(SELECT 1 FROM invitations WHERE grant_id=grants.id) AND NOT EXISTS(SELECT 1 FROM processed_requests WHERE grant_id=grants.id) LIMIT 200)").execute(&self.pool).await?;
+        query("DELETE FROM policies WHERE id IN (SELECT id FROM policies WHERE deleted_at<unixepoch()-2592000 AND NOT EXISTS(SELECT 1 FROM grants WHERE policy_id=policies.id) LIMIT 200)").execute(&self.pool).await?;
         Ok(())
     }
     pub async fn pending_inputs(&self) -> Result<Vec<String>, StoreError> {

@@ -16,9 +16,10 @@ export function resolveTeam(
 
 export const workspaceSections = [
     "keys",
+    "connections",
     "policies",
-    "members",
     "activity",
+    "members",
     "settings",
 ] as const;
 export type WorkspaceSection = (typeof workspaceSections)[number];

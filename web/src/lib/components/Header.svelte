@@ -4,13 +4,14 @@
     import { getCurrentUser } from "#lib/current_user.svelte";
     import { signout } from "#lib/utils/auth";
     import { Key, SignOut } from "phosphor-svelte";
+
     const user = $derived(getCurrentUser()?.user);
 </script>
 
 <header class="app-header">
     <div class="header-inner">
         <a href={user ? "/teams" : "/"} class="brand" aria-label="Keycast home"
-            ><span class="brand-mark" aria-hidden="true"><Key size={22} weight="regular" /></span>keycast</a
+            ><span class="brand-mark" aria-hidden="true"><Key size={16} weight="bold" /></span>Keycast</a
         >
         <nav class="header-nav" aria-label="Main navigation">
             {#if user}
@@ -32,9 +33,9 @@
                 >
                 <button
                     onclick={signout}
-                    class="button button-quiet"
+                    class="button button-quiet button-sm"
                     aria-label="Sign out"
-                    ><SignOut size={18} /><span class="hidden sm:inline"
+                    ><SignOut size={15} /><span class="hidden sm:inline"
                         >Sign out</span
                     ></button
                 >

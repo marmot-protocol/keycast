@@ -1,4 +1,5 @@
-use std::fs;
+use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use aes_gcm::aead::{Aead, Generate, KeyInit, Nonce, Payload};
@@ -28,6 +29,8 @@ pub struct EnvelopeCipher {
     key_id: String,
     /// Seed for the stable management-reply identity. Never leaves this type.
     reply_seed: Zeroizing<[u8; 32]>,
+    /// Cached hex public key of the derived management-reply identity.
+    reply_public_key: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -64,8 +67,14 @@ impl EnvelopeCipher {
     }
 
     pub fn from_file(path: &Path) -> Result<Self, EnvelopeError> {
-        ensure_private_permissions(path)?;
-        let encoded = Zeroizing::new(fs::read_to_string(path)?);
+        let file = File::open(path)?;
+        ensure_private_file_permissions(path, &file)?;
+        let mut encoded = Zeroizing::new(String::new());
+        // A valid hex or base64 32-byte key is at most 64 bytes plus whitespace.
+        let read = file.take(257).read_to_string(&mut encoded)?;
+        if read > 256 {
+            return Err(EnvelopeError::InvalidCredential);
+        }
         let key = decode_root_key(encoded.trim())?;
         Ok(Self::from_key(key))
     }
@@ -83,11 +92,15 @@ impl EnvelopeCipher {
         hasher.update(REPLY_IDENTITY_INFO);
         hasher.update(key.as_ref());
         reply_seed.copy_from_slice(&hasher.finalize());
+        let reply_public_key = derive_reply_keys(&reply_seed)
+            .ok()
+            .map(|keys| keys.public_key().to_hex());
         let cipher = Aes256Gcm::new((&*key).into());
         Self {
             cipher,
             key_id,
             reply_seed,
+            reply_public_key,
         }
     }
 
@@ -98,27 +111,12 @@ impl EnvelopeCipher {
     /// Stable identity used to encrypt management replies, so a browser can
     /// authenticate their origin instead of trusting a per-reply ephemeral key.
     pub fn management_reply_keys(&self) -> Result<nostr::prelude::Keys, EnvelopeError> {
-        let mut candidate = self.reply_seed.clone();
-        // A SHA-256 digest is a valid secp256k1 scalar with overwhelming probability;
-        // rehash on the astronomically unlikely miss rather than failing the instance.
-        for attempt in 0_u8..=8 {
-            if let Ok(secret) = nostr::prelude::SecretKey::from_slice(candidate.as_ref()) {
-                return Ok(nostr::prelude::Keys::new(secret));
-            }
-            let mut hasher = Sha256::new();
-            hasher.update(REPLY_IDENTITY_INFO);
-            hasher.update([attempt]);
-            hasher.update(candidate.as_ref());
-            candidate.copy_from_slice(&hasher.finalize());
-        }
-        Err(EnvelopeError::InvalidCredential)
+        derive_reply_keys(&self.reply_seed)
     }
 
     /// Hex public key of [`Self::management_reply_keys`], safe to publish.
     pub fn management_reply_public_key(&self) -> Option<String> {
-        self.management_reply_keys()
-            .ok()
-            .map(|keys| keys.public_key().to_hex())
+        self.reply_public_key.clone()
     }
 
     pub fn seal(
@@ -215,11 +213,30 @@ fn decode_hex(value: &str) -> Result<Vec<u8>, ()> {
         .collect()
 }
 
+fn derive_reply_keys(
+    reply_seed: &Zeroizing<[u8; 32]>,
+) -> Result<nostr::prelude::Keys, EnvelopeError> {
+    let mut candidate = reply_seed.clone();
+    // A SHA-256 digest is a valid secp256k1 scalar with overwhelming probability;
+    // rehash on the astronomically unlikely miss rather than failing the instance.
+    for attempt in 0_u8..=8 {
+        if let Ok(secret) = nostr::prelude::SecretKey::from_slice(candidate.as_ref()) {
+            return Ok(nostr::prelude::Keys::new(secret));
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(REPLY_IDENTITY_INFO);
+        hasher.update([attempt]);
+        hasher.update(candidate.as_ref());
+        candidate.copy_from_slice(&hasher.finalize());
+    }
+    Err(EnvelopeError::InvalidCredential)
+}
+
 #[cfg(unix)]
-fn ensure_private_permissions(path: &Path) -> Result<(), EnvelopeError> {
+fn ensure_private_file_permissions(path: &Path, file: &File) -> Result<(), EnvelopeError> {
     use std::os::unix::fs::PermissionsExt;
 
-    let metadata = fs::metadata(path)?;
+    let metadata = file.metadata()?;
     if !metadata.is_file() {
         return Err(EnvelopeError::InvalidCredential);
     }
@@ -230,8 +247,11 @@ fn ensure_private_permissions(path: &Path) -> Result<(), EnvelopeError> {
 }
 
 #[cfg(not(unix))]
-fn ensure_private_permissions(path: &Path) -> Result<(), EnvelopeError> {
-    fs::metadata(path)?;
+fn ensure_private_file_permissions(_path: &Path, file: &File) -> Result<(), EnvelopeError> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(EnvelopeError::InvalidCredential);
+    }
     Ok(())
 }
 

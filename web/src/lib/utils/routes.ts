@@ -1,4 +1,4 @@
-const protectedRoutePrefixes = ["/teams", "/keys"];
+const protectedRoutePrefixes = ["/teams", "/keys", "/status"];
 
 export function isProtectedRoute(pathname: string): boolean {
     return protectedRoutePrefixes.some(

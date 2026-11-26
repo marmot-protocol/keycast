@@ -6,7 +6,7 @@ umask 077
 KEY_FILE="${KEYCAST_ROOT_KEY_PATH:-master.key}"
 
 # Never offer an overwrite shortcut: replacing this file makes every stored key undecryptable.
-if [ -f "$KEY_FILE" ]; then
+if [ -e "$KEY_FILE" ] || [ -L "$KEY_FILE" ]; then
     echo "Error: $KEY_FILE already exists; refusing to overwrite it."
     exit 1
 fi

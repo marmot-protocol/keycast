@@ -16,6 +16,7 @@ export async function checkPubkeyAllowed(
     const params = new URLSearchParams({ pubkey });
     const response = await fetcher(`${defaultApiBaseUrl()}/config?${params}`, {
         headers: { Accept: "application/json" },
+        signal: AbortSignal.timeout(20000),
     });
 
     if (!response.ok) {

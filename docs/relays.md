@@ -8,7 +8,7 @@ keys can also have discovered routes associated with them.
 
 ## Baseline routes
 
-Fresh installations use `wss://nos.lol`, `wss://relay.primal.net`, and `wss://relay.damus.io`.
+Fresh installations use `wss://nos.lol` and `wss://relay.primal.net`.
 These are configured defaults, not promises about a relay's current availability. Existing configured
 sets and client routes are preserved when defaults change.
 

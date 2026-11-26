@@ -1,14 +1,18 @@
-use crate::state::KeycastState;
+use crate::state::{KeycastState, SignerClientError};
 use axum::{
     body::{to_bytes, Body, HttpBody},
     extract::State,
-    http::{Request, StatusCode},
+    http::{Method, Request, StatusCode},
     response::{IntoResponse, Response},
 };
 use keycast_core::v2::{
     control::{ControlRequest, ControlResponse},
     management::MAX_HTTP_BODY,
 };
+use zeroize::Zeroize;
+
+const MAX_PATH_BYTES: usize = 4096;
+const MAX_AUTHORIZATION_BYTES: usize = 16384;
 
 pub async fn forward(State(state): State<KeycastState>, request: Request<Body>) -> Response {
     static ADMISSION: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(32);
@@ -19,6 +23,31 @@ pub async fn forward(State(state): State<KeycastState>, request: Request<Body>) 
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
         .map(|info| info.0.ip());
     let (parts, body) = request.into_parts();
+    if !matches!(
+        parts.method,
+        Method::GET | Method::HEAD | Method::POST | Method::PUT | Method::DELETE
+    ) {
+        return StatusCode::METHOD_NOT_ALLOWED.into_response();
+    }
+    let path = parts.uri.to_string();
+    if path.len() > MAX_PATH_BYTES {
+        return StatusCode::URI_TOO_LONG.into_response();
+    }
+    if !path.starts_with('/') || path.starts_with("//") {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let authorization = match parts.headers.get("authorization") {
+        Some(header) => {
+            if header.len() > MAX_AUTHORIZATION_BYTES {
+                return StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE.into_response();
+            }
+            match header.to_str() {
+                Ok(value) => Some(value.to_owned()),
+                Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+            }
+        }
+        None => None,
+    };
     if body.size_hint().lower() > MAX_HTTP_BODY as u64 {
         return StatusCode::PAYLOAD_TOO_LARGE.into_response();
     }
@@ -44,17 +73,18 @@ pub async fn forward(State(state): State<KeycastState>, request: Request<Body>) 
     let Ok(_permit) = ADMISSION.try_acquire() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let Ok(body) = String::from_utf8(bytes.to_vec()) else {
-        return StatusCode::BAD_REQUEST.into_response();
+    let body = match String::from_utf8(Vec::from(bytes)) {
+        Ok(body) => body,
+        Err(error) => {
+            let mut raw = error.into_bytes();
+            raw.zeroize();
+            return StatusCode::BAD_REQUEST.into_response();
+        }
     };
     let request = ControlRequest::Http {
         method: parts.method.to_string(),
-        path: parts.uri.to_string(),
-        authorization: parts
-            .headers
-            .get("authorization")
-            .and_then(|h| h.to_str().ok())
-            .map(str::to_owned),
+        path,
+        authorization,
         // A browser key import travels through this body; erase it on drop.
         body: keycast_core::v2::secret::Secret::new(body),
     };
@@ -63,8 +93,12 @@ pub async fn forward(State(state): State<KeycastState>, request: Request<Body>) 
             .status(reply.status)
             .header("content-type", "application/json")
             .header("cache-control", "no-store")
+            .header("x-content-type-options", "nosniff")
             .body(Body::from(reply.body))
             .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response()),
+        Err(SignerClientError::Rejected { code, .. }) if code == "invalid_request" => {
+            StatusCode::BAD_REQUEST.into_response()
+        }
         _ => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
 }

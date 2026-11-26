@@ -39,12 +39,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let public_url = url::Url::parse(
         &std::env::var("KEYCAST_PUBLIC_URL").map_err(|_| "KEYCAST_PUBLIC_URL is required")?,
     )?;
-    if !(public_url.scheme() == "https"
-        || (public_url.scheme() == "http"
-            && matches!(
-                public_url.host_str(),
-                Some("localhost" | "127.0.0.1" | "[::1]")
-            )))
+    let is_loopback = matches!(
+        public_url.host_str(),
+        Some("localhost" | "127.0.0.1" | "[::1]")
+    );
+    if !(public_url.scheme() == "https" || (public_url.scheme() == "http" && is_loopback))
         || public_url.path().trim_end_matches('/') != "/api"
         || public_url.query().is_some()
         || public_url.fragment().is_some()
@@ -55,14 +54,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "KEYCAST_PUBLIC_URL must be an HTTPS /api URL (HTTP allowed only on loopback)".into(),
         );
     }
+    let open_registration = std::env::var("KEYCAST_ALLOW_OPEN_REGISTRATION")
+        .ok()
+        .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true"));
+    if open_registration && !is_loopback {
+        return Err(
+            "KEYCAST_ALLOW_OPEN_REGISTRATION is only permitted when KEYCAST_PUBLIC_URL targets loopback"
+                .into(),
+        );
+    }
     for name in ["ALLOWED_PUBKEYS", "KEYCAST_OPERATOR_PUBKEYS"] {
+        use nostr::nips::nip19::FromBech32;
         let raw = std::env::var(name).unwrap_or_default();
         if !raw.is_empty()
             && raw.split(',').any(|value| {
-                value.len() != 64 || nostr::prelude::PublicKey::from_hex(value).is_err()
+                let valid_hex = value.len() == 64
+                    && value.bytes().all(|b| b.is_ascii_hexdigit())
+                    && nostr::prelude::PublicKey::from_hex(value).is_ok();
+                let valid_npub = value.len() >= 60
+                    && (value.starts_with("npub1") || value.starts_with("NPUB1"))
+                    && nostr::prelude::PublicKey::from_bech32(value).is_ok();
+                !(valid_hex || valid_npub)
             })
         {
-            return Err(format!("{name} must contain comma-separated 64-character hex pubkeys without whitespace or empty entries").into());
+            return Err(format!("{name} must contain comma-separated 64-character hex or npub1 pubkeys without whitespace or empty entries").into());
         }
     }
     let db_path = database_path_from_env(repository_root);

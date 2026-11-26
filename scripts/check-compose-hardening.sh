@@ -31,42 +31,77 @@ done
 ok "all Compose files render"
 
 for file in "${APPLICATION_COMPOSE_FILES[@]}"; do
-    rendered="$(docker compose -f "$file" config)"
+    if docker compose -f "$file" config --format json |
+        python3 -c '
+import json, os, sys
 
-    # Swap must be disabled wherever plaintext key material can live, and no
-    # service may run with a writable root filesystem.
-    for setting in memswap_limit read_only; do
-        if [[ "$(printf '%s' "$rendered" | grep -c "$setting")" -ge 3 ]]; then
-            ok "$file: $setting is set on every service"
-        else
-            fail "$file: $setting is missing from at least one service"
-        fi
-    done
+config = json.load(sys.stdin)
+services = config.get("services", {})
+expected = {"keycast-signer", "keycast-api", "keycast-web"}
+errors = []
 
-    if printf '%s' "$rendered" | grep -q 'noexec,nosuid,nodev'; then
-        ok "$file: tmpfs mounts are noexec, nosuid and nodev"
+missing = expected - set(services)
+if missing:
+    errors.append(f"missing services: {sorted(missing)}")
+
+for name, svc in services.items():
+    if svc.get("read_only") is not True:
+        errors.append(f"{name}: read_only must be true")
+    if svc.get("user") != "10001:10001":
+        errors.append(f"{name}: user must be 10001:10001")
+    mem = svc.get("mem_limit")
+    swap = svc.get("memswap_limit")
+    if not mem or swap != mem:
+        errors.append(f"{name}: memswap_limit ({swap}) must equal mem_limit ({mem})")
+    if svc.get("cap_drop") != ["ALL"]:
+        errors.append(f"{name}: cap_drop must be [\"ALL\"]")
+    if svc.get("cap_add"):
+        errors.append("{}: unexpected cap_add {}".format(name, svc.get("cap_add")))
+    sec = svc.get("security_opt") or []
+    if "no-new-privileges:true" not in sec:
+        errors.append(f"{name}: missing no-new-privileges:true")
+    ulimits = svc.get("ulimits") or {}
+    core = ulimits.get("core")
+    if "core" not in ulimits or not (
+        core == 0 or (isinstance(core, dict) and core.get("soft", 0) == 0 and core.get("hard", 0) == 0)
+    ):
+        errors.append(f"{name}: ulimits.core must be 0")
+    tmpfs = svc.get("tmpfs") or []
+    if not any("noexec" in str(t) and "nosuid" in str(t) and "nodev" in str(t) for t in tmpfs):
+        errors.append(f"{name}: tmpfs must set noexec,nosuid,nodev")
+
+signer_nets = set((services.get("keycast-signer") or {}).get("networks") or [])
+if signer_nets != {"keycast-signer-egress"}:
+    errors.append(f"keycast-signer networks must be only keycast-signer-egress, got {sorted(signer_nets)}")
+
+for isolated in ("keycast-api", "keycast-web"):
+    svc = services.get(isolated) or {}
+    nets = set(svc.get("networks") or [])
+    if nets != {"keycast"}:
+        errors.append(f"{isolated} networks must be only keycast, got {sorted(nets)}")
+    for vol in svc.get("volumes") or []:
+        mount = "{}:{}".format(vol.get("source", ""), vol.get("target", "")) if isinstance(vol, dict) else str(vol)
+        if any(tok in mount for tok in ("master.key", "database", "/run/secrets")):
+            errors.append(f"{isolated} must not mount secret/database volume: {mount}")
+
+if errors:
+    print("; ".join(errors))
+    sys.exit(1)
+'; then
+        ok "$file: per-service hardening, swap cap, isolation, and volume boundaries verified"
     else
-        fail "$file: tmpfs mounts are not hardened"
-    fi
-
-    # The signer holds the keys and needs no inbound path, so it must not sit on
-    # the ingress network beside the public transport.
-    if printf '%s' "$rendered" | grep -q 'keycast-signer-egress'; then
-        ok "$file: the signer uses its own egress network"
-    else
-        fail "$file: the signer egress network is missing"
+        fail "$file: per-service hardening verification failed"
     fi
 done
 
-# Inspect rendered mounts, never file text: the proxy example documents the
-# removal of the socket mount in a comment that a text search would match.
+# Verify proxy example hardening and that no Compose file mounts the Docker socket.
 for file in "${COMPOSE_FILES[@]}"; do
     if docker compose -f "$file" config --format json |
         python3 -c '
-import json, sys
+import json, os, sys
 
 config = json.load(sys.stdin)
-mounts = []
+errors = []
 for name, service in config.get("services", {}).items():
     for volume in service.get("volumes", []):
         if isinstance(volume, dict):
@@ -74,14 +109,28 @@ for name, service in config.get("services", {}).items():
         else:
             mount = str(volume)
         if "docker.sock" in mount:
-            mounts.append("{} -> {}".format(name, mount))
-if mounts:
-    print("; ".join(mounts))
+            errors.append("docker.sock mount: {} -> {}".format(name, mount))
+    if name == "caddy":
+        if service.get("read_only") is not True:
+            errors.append("caddy: read_only must be true")
+        mem = service.get("mem_limit")
+        swap = service.get("memswap_limit")
+        if not mem or swap != mem:
+            errors.append("caddy: memswap_limit must equal mem_limit")
+        if service.get("cap_drop") != ["ALL"]:
+            errors.append("caddy: cap_drop must be [\"ALL\"]")
+        extra_caps = sorted(set(service.get("cap_add") or []) - {"NET_BIND_SERVICE"})
+        if extra_caps:
+            errors.append("caddy: unexpected cap_add {}".format(extra_caps))
+        if "no-new-privileges:true" not in (service.get("security_opt") or []):
+            errors.append("caddy: missing no-new-privileges:true")
+if errors:
+    print("; ".join(errors))
     sys.exit(1)
 '; then
-        ok "$file mounts no Docker socket"
+        ok "$file mounts no Docker socket and meets proxy hardening checks"
     else
-        fail "$file mounts the Docker socket"
+        fail "$file failed Docker socket / proxy hardening checks"
     fi
 done
 

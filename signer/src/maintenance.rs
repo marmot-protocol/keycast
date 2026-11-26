@@ -6,7 +6,8 @@ use keycast_core::{
     v2::envelope::{EnvelopeCipher, EnvelopeContext},
 };
 use sqlx::{query::query, query_as::query_as, query_scalar::query_scalar};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use sqlx_sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::{
     fs::{File, OpenOptions},
     io::{Read, Write},
@@ -81,7 +82,7 @@ pub async fn verify_root(store: &Store) -> Result<()> {
     if expected
         .as_deref()
         .is_some_and(|id| id != store.cipher.key_id())
-        || (expected.is_none() && mismatches != 0)
+        || mismatches != 0
     {
         return Err("root credential does not match this database".into());
     }
@@ -118,10 +119,38 @@ pub async fn command(args: &[String], root: &Path) -> Result<()> {
     if !db_path.is_file() {
         return Err("existing database required".into());
     }
-    let _maintenance = lock(
-        &maintenance_path(&db_path),
-        op == "backup" || op == "audit-export",
-    )?;
+    if db_path
+        .parent()
+        .is_some_and(|dir| dir.join("RESTORE_INCOMPLETE").exists())
+    {
+        return Err(
+            "database directory has RESTORE_INCOMPLETE; discard it and run restore again".into(),
+        );
+    }
+    if op == "audit-export" && args.len() == 2 {
+        // Open strictly read-only so host runs never create WAL/SHM sidecars with root ownership.
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&db_path)
+                    .read_only(true),
+            )
+            .await?;
+        let rows: Vec<String> = query_scalar("SELECT json_object('id',id,'occurred_at',occurred_at,'team_id',team_id,'stored_key_id',stored_key_id,'grant_id',grant_id,'session_id',session_id,'actor_public_key',actor_public_key,'action',action,'outcome',outcome,'reason_code',reason_code,'request_event_id',request_event_id) FROM audit_events ORDER BY id")
+            .fetch_all(&pool)
+            .await?;
+        pool.close().await;
+        private_write_with(Path::new(&args[1]), |file| {
+            for row in rows {
+                file.write_all(row.as_bytes())?;
+                file.write_all(b"\n")?;
+            }
+            Ok(())
+        })?;
+        return Ok(());
+    }
+    let _maintenance = lock(&maintenance_path(&db_path), op == "backup")?;
     let db = Database::new(db_path.clone(), migrations_path_from_env(root)).await?;
     let cipher = EnvelopeCipher::load()?;
     let store = Store::new(db.pool.clone(), cipher);
@@ -146,17 +175,6 @@ pub async fn command(args: &[String], root: &Path) -> Result<()> {
                 .await?;
             println!("Imported public key {}", key.public_key);
         }
-        "audit-export" if args.len() == 2 => {
-            // Intentionally omit details/payloads/ciphertext, even if database contents are malformed.
-            let rows:Vec<String>=query_scalar("SELECT json_object('id',id,'occurred_at',occurred_at,'team_id',team_id,'stored_key_id',stored_key_id,'grant_id',grant_id,'session_id',session_id,'actor_public_key',actor_public_key,'action',action,'outcome',outcome,'reason_code',reason_code,'request_event_id',request_event_id) FROM audit_events ORDER BY id").fetch_all(&db.pool).await?;
-            private_write_with(Path::new(&args[1]), |file| {
-                for row in rows {
-                    file.write_all(row.as_bytes())?;
-                    file.write_all(b"\n")?;
-                }
-                Ok(())
-            })?;
-        }
         "backup" if args.len() == 3 => {
             let backup_cipher = EnvelopeCipher::from_file(Path::new(&args[1]))?;
             // The manifest carries the root credential, so the archive is only as
@@ -169,7 +187,17 @@ pub async fn command(args: &[String], root: &Path) -> Result<()> {
             }
             let root_path = keycast_core::v2::envelope::credential_path()
                 .ok_or("root credential path required")?;
-            let private_root = Zeroizing::new(std::fs::read_to_string(root_path)?);
+            let verified_root = EnvelopeCipher::from_file(&root_path)?;
+            if verified_root.key_id() != store.cipher.key_id() {
+                return Err("root credential changed during backup; aborting".into());
+            }
+            let mut private_root = Zeroizing::new(String::new());
+            File::open(&root_path)?
+                .take(256)
+                .read_to_string(&mut private_root)?;
+            if EnvelopeCipher::from_file(&root_path)?.key_id() != store.cipher.key_id() {
+                return Err("root credential changed during backup; aborting".into());
+            }
             let temporary = db_path.with_extension(format!(
                 "snapshot-{}",
                 nostr::prelude::Keys::generate().public_key()
@@ -204,10 +232,12 @@ pub async fn command(args: &[String], root: &Path) -> Result<()> {
             println!("Rotation committed. Configure KEYCAST_ROOT_KEY_FILE to the new file before restarting. Keep both credentials until a new backup has been verified.");
         }
         "review-restore" if args.len() == 1 => {
-            query("UPDATE instance_settings SET recovery_pending=0,authority_revision=authority_revision+1 WHERE singleton=1").execute(&db.pool).await?;
+            let mut tx = db.pool.begin().await?;
+            query("UPDATE instance_settings SET recovery_pending=0,authority_revision=authority_revision+1 WHERE singleton=1").execute(&mut *tx).await?;
             query("INSERT INTO audit_events(action,outcome) VALUES('recovery.review','succeeded')")
-                .execute(&db.pool)
+                .execute(&mut *tx)
                 .await?;
+            tx.commit().await?;
             println!("Recovery review recorded. Previous grants remain revoked; create new grants and invitations.");
         }
         _ => return Err("invalid command arguments; run help".into()),
@@ -259,9 +289,9 @@ async fn restore(key: &Path, archive: &Path, directory: &Path, root: &Path) -> R
     let cipher = EnvelopeCipher::from_file(key)?;
     let mut input = File::open(archive)?;
     let manifest = crate::backup::manifest(&cipher, &mut input)?;
-    // Fresh directory only; a failed restore is never mistaken for a usable instance.
-    std::fs::create_dir(directory)?;
-    std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))?;
+    // Fresh directory only, created atomically with 0700 permissions so there is no
+    // world-readable window before writing the restored root key and database.
+    std::fs::DirBuilder::new().mode(0o700).create(directory)?;
     private_write(
         &directory.join("RESTORE_INCOMPLETE"),
         b"Do not start this database",
@@ -271,6 +301,23 @@ async fn restore(key: &Path, archive: &Path, directory: &Path, root: &Path) -> R
     private_write_with(&path, |output| {
         crate::backup::open(&cipher, &manifest, &mut input, output)
     })?;
+    // Verify full database integrity and foreign keys read-only before running any migrations.
+    {
+        let check_pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(SqliteConnectOptions::new().filename(&path).read_only(true))
+            .await?;
+        let integrity: String = query_scalar("PRAGMA integrity_check")
+            .fetch_one(&check_pool)
+            .await?;
+        let fk_violations: Vec<(String, i64, String, i64)> = query_as("PRAGMA foreign_key_check")
+            .fetch_all(&check_pool)
+            .await?;
+        check_pool.close().await;
+        if integrity != "ok" || !fk_violations.is_empty() {
+            return Err("restored database integrity or foreign key check failed".into());
+        }
+    }
     let db = Database::new(path, migrations_path_from_env(root)).await?;
     if !db.integrity_check().await? {
         return Err("restored database integrity check failed".into());
@@ -281,11 +328,11 @@ async fn restore(key: &Path, archive: &Path, directory: &Path, root: &Path) -> R
     ))
     .await?;
     let mut tx = db.pool.begin().await?;
-    query("UPDATE sessions SET ended_at=unixepoch(),end_reason='revoked' WHERE ended_at IS NULL")
+    query("UPDATE sessions SET ended_at=max(unixepoch(),connected_at),end_reason='revoked' WHERE ended_at IS NULL")
         .execute(&mut *tx)
         .await?;
-    query("UPDATE invitations SET revoked_at=unixepoch() WHERE consumed_at IS NULL AND revoked_at IS NULL").execute(&mut *tx).await?;
-    query("UPDATE grants SET revoked_at=unixepoch() WHERE revoked_at IS NULL")
+    query("UPDATE invitations SET revoked_at=max(unixepoch(),created_at) WHERE consumed_at IS NULL AND revoked_at IS NULL").execute(&mut *tx).await?;
+    query("UPDATE grants SET revoked_at=max(unixepoch(),created_at) WHERE revoked_at IS NULL")
         .execute(&mut *tx)
         .await?;
     query("DELETE FROM processed_requests")

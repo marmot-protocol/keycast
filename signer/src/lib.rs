@@ -2,6 +2,7 @@ mod admission;
 mod backup;
 pub mod control;
 pub mod discovery;
+pub mod grant_diagnostics;
 pub mod management;
 pub mod protocol;
 mod public_relay;

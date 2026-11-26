@@ -30,6 +30,7 @@ const MAX_AUTH_BODY_BYTES: usize = 1024 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PublicConfig {
     pub pubkey_allowed: bool,
+    pub is_operator: bool,
     pub instance_id: String,
     pub authority_revision: i64,
     /// Stable identity that encrypts management replies. A browser pins this and
@@ -242,8 +243,12 @@ pub async fn public_config(
         .cipher
         .management_reply_public_key()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let trimmed = query.pubkey.trim();
+    let pubkey_allowed = !trimmed.is_empty() && is_allowed_pubkey_hex(trimmed);
+    let is_operator = pubkey_allowed && teams::is_operator(trimmed);
     Ok(Json(PublicConfig {
-        pubkey_allowed: is_allowed_pubkey_hex(&query.pubkey),
+        pubkey_allowed,
+        is_operator,
         instance_id,
         authority_revision,
         management_reply_public_key,
@@ -251,10 +256,8 @@ pub async fn public_config(
 }
 
 fn response_with_status(status: StatusCode, message: &'static str) -> Response {
-    Response::builder()
-        .status(status)
-        .body(message.into())
-        .unwrap()
+    use axum::response::IntoResponse;
+    (status, Json(serde_json::json!({ "error": message }))).into_response()
 }
 
 fn validate_token(
@@ -320,13 +323,6 @@ pub fn validate_auth_event(
     body: &[u8],
     public_url: &str,
 ) -> Result<(), AuthenticationError> {
-    if event.verify().is_err() {
-        tracing::debug!("Token validation failed: Event verification failed");
-        return Err(AuthenticationError::InvalidEvent(
-            "Event verification failed".to_string(),
-        ));
-    }
-
     let write = !matches!(
         *request.method(),
         axum::http::Method::GET | axum::http::Method::HEAD
@@ -385,6 +381,13 @@ pub fn validate_auth_event(
     }
 
     validate_payload_tag(event, body)?;
+
+    if event.verify().is_err() {
+        tracing::debug!("Token validation failed: Event verification failed");
+        return Err(AuthenticationError::InvalidEvent(
+            "Event verification failed".to_string(),
+        ));
+    }
 
     Ok(())
 }
@@ -462,15 +465,33 @@ fn is_allowed_pubkey(pubkey: &PublicKey) -> bool {
     is_allowed_pubkey_hex(&pubkey.to_hex())
 }
 
+pub(crate) fn parse_pubkey_hex_or_npub(raw: &str) -> Option<String> {
+    use nostr::nips::nip19::FromBech32;
+    let trimmed = raw.trim();
+    if trimmed.len() == 64 && trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return PublicKey::from_hex(trimmed).ok().map(|pk| pk.to_hex());
+    }
+    if trimmed.len() >= 60 && (trimmed.starts_with("npub1") || trimmed.starts_with("NPUB1")) {
+        return PublicKey::from_bech32(trimmed).ok().map(|pk| pk.to_hex());
+    }
+    None
+}
+
+fn normalize_pubkey_entry(raw: &str) -> String {
+    let trimmed = raw.trim();
+    parse_pubkey_hex_or_npub(trimmed).unwrap_or_else(|| trimmed.to_owned())
+}
+
 fn is_allowed_pubkey_hex(pubkey_hex: &str) -> bool {
     let allowed_pubkeys = configured_allowed_pubkeys();
     if allowed_pubkeys.is_empty() {
         return open_registration_enabled();
     }
 
+    let candidate = normalize_pubkey_entry(pubkey_hex);
     allowed_pubkeys
         .iter()
-        .any(|allowed| allowed.eq_ignore_ascii_case(pubkey_hex))
+        .any(|allowed| allowed.eq_ignore_ascii_case(&candidate))
 }
 
 fn open_registration_enabled() -> bool {
@@ -490,7 +511,7 @@ fn parse_allowed_pubkeys(raw_allowlist: &str) -> Vec<String> {
         .split(',')
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
+        .map(normalize_pubkey_entry)
         .collect()
 }
 
@@ -735,6 +756,27 @@ mod tests {
         assert_eq!(configured_allowed_pubkeys(), vec!["abc", "def", "ghi"]);
 
         env::remove_var("ALLOWED_PUBKEYS");
+    }
+
+    #[test]
+    fn npub_and_hex_entries_work_in_allowlist_and_operators() {
+        use nostr::nips::nip19::ToBech32;
+        let _guard = ENV_LOCK.lock().unwrap();
+        let keys = nostr::prelude::Keys::generate();
+        let hex = keys.public_key().to_hex();
+        let npub = keys.public_key().to_bech32().unwrap();
+        env::set_var("ALLOWED_PUBKEYS", format!("abc, {npub}"));
+        env::set_var("KEYCAST_OPERATOR_PUBKEYS", &npub);
+
+        assert!(is_allowed_pubkey_hex(&hex));
+        assert!(is_allowed_pubkey_hex(&npub));
+        assert!(teams::is_operator(&hex));
+        assert!(teams::is_operator(&npub));
+        assert!(!teams::is_operator(""));
+
+        env::remove_var("ALLOWED_PUBKEYS");
+        env::remove_var("KEYCAST_OPERATOR_PUBKEYS");
+        assert!(!teams::is_operator(""));
     }
 
     #[test]
@@ -1016,6 +1058,348 @@ mod tests {
             .unwrap();
         assert_eq!(decrypt_reply(response, &keys).await.status, 403);
         env::remove_var("ALLOWED_PUBKEYS");
+    }
+
+    #[tokio::test]
+    async fn team_grants_diagnostics_and_operator_flag_enforce_roles() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let pool = setup_route_test_db().await;
+        let admin = Keys::generate();
+        let member = Keys::generate();
+        let client_one = Keys::generate();
+        let client_two = Keys::generate();
+        env::set_var(
+            "ALLOWED_PUBKEYS",
+            format!(
+                "{},{}",
+                admin.public_key().to_hex(),
+                member.public_key().to_hex()
+            ),
+        );
+        env::set_var("KEYCAST_OPERATOR_PUBKEYS", admin.public_key().to_hex());
+
+        let app_state = state(pool.clone());
+        let app = routes::routes(app_state.clone());
+
+        // /config exposes is_operator accurately per queried pubkey
+        let cfg_admin = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/config?pubkey={}", admin.public_key().to_hex()))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let cfg_admin_json: serde_json::Value = serde_json::from_slice(
+            &to_bytes(cfg_admin.into_body(), MAX_AUTH_BODY_BYTES)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cfg_admin_json["is_operator"], true);
+
+        let cfg_member = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/config?pubkey={}", member.public_key().to_hex()))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let cfg_member_json: serde_json::Value = serde_json::from_slice(
+            &to_bytes(cfg_member.into_body(), MAX_AUTH_BODY_BYTES)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cfg_member_json["is_operator"], false);
+
+        // Seed team, admin, member, key, policy, grant, session, and a pre-admission drop
+        for pk in [admin.public_key().to_hex(), member.public_key().to_hex()] {
+            query("INSERT INTO users(public_key) VALUES (?)")
+                .bind(pk)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        let team_id: i64 = query_scalar("INSERT INTO teams(name) VALUES ('Ops') RETURNING id")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        query("INSERT INTO team_members(team_id, user_public_key, role) VALUES (?, ?, 'admin')")
+            .bind(team_id)
+            .bind(admin.public_key().to_hex())
+            .execute(&pool)
+            .await
+            .unwrap();
+        query("INSERT INTO team_members(team_id, user_public_key, role) VALUES (?, ?, 'member')")
+            .bind(team_id)
+            .bind(member.public_key().to_hex())
+            .execute(&pool)
+            .await
+            .unwrap();
+        let policy_id: i64 = query_scalar(
+            "INSERT INTO policies(team_id, name, document)
+             VALUES (?, 'Zapstore Releases', '{\"version\":1,\"capabilities\":{\"sign_event\":{\"allowed_kinds\":[32267,30063,3063]}}}')
+             RETURNING id",
+        )
+        .bind(team_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let hosted_keys = Keys::generate();
+        let stored_key = app_state
+            .signer
+            .runtime
+            .store
+            .seal_stored_key(
+                team_id,
+                &admin.public_key().to_hex(),
+                "Publisher".to_string(),
+                zeroize::Zeroizing::new(hosted_keys.secret_key().to_secret_hex()),
+            )
+            .await
+            .unwrap();
+        let (grant_summary, _inv_id, bunker_uri) = app_state
+            .signer
+            .runtime
+            .store
+            .create_grant(
+                team_id,
+                &admin.public_key().to_hex(),
+                stored_key.id,
+                policy_id,
+                "nak CLI".to_string(),
+                None,
+                chrono::Utc::now().timestamp() + 3600,
+            )
+            .await
+            .unwrap();
+        let secret = bunker_uri.split("secret=").nth(1).unwrap().to_string();
+        let runtime_grant = app_state
+            .signer
+            .runtime
+            .store
+            .grant_for_recipient(&grant_summary.remote_signer_public_key)
+            .await
+            .unwrap()
+            .unwrap();
+        let processor = crate::protocol::RequestProcessor::with_diagnostics(
+            app_state.signer.runtime.store.clone(),
+            app_state.signer.runtime.metrics.clone(),
+            app_state.signer.runtime.grant_diagnostics.clone(),
+        );
+        let remote_pk = PublicKey::from_hex(&grant_summary.remote_signer_public_key).unwrap();
+        let make_nip46 = |keys: &Keys, payload: serde_json::Value| -> Event {
+            let ct = nostr::nips::nip44::encrypt(
+                keys.secret_key(),
+                &remote_pk,
+                payload.to_string(),
+                nostr::nips::nip44::Version::default(),
+            )
+            .unwrap();
+            EventBuilder::new(Kind::NostrConnect, ct)
+                .tag(Tag::public_key(remote_pk))
+                .finalize(keys)
+                .unwrap()
+        };
+
+        // 1. Client one claims the invitation
+        let connect_one = make_nip46(
+            &client_one,
+            serde_json::json!({"id":"c1","method":"connect","params":[remote_pk.to_hex(), secret]}),
+        );
+        processor
+            .prepare_response_from_relay(&connect_one, Some("wss://nos.lol"))
+            .await
+            .unwrap();
+
+        // 2. Client two tries to reuse the consumed secret -> dropped & recorded in grant_diagnostics
+        let connect_two = make_nip46(
+            &client_two,
+            serde_json::json!({"id":"c2","method":"connect","params":[remote_pk.to_hex(), secret]}),
+        );
+        assert!(processor
+            .prepare_response_from_relay(&connect_two, Some("wss://nos.lol"))
+            .await
+            .is_err());
+
+        // 3. Client one requests a denied kind 24242 -> audit row records details.kind = 24242
+        let denied_sign = make_nip46(
+            &client_one,
+            serde_json::json!({
+                "id": "s1",
+                "method": "sign_event",
+                "params": [serde_json::json!({
+                    "kind": 24242,
+                    "content": "upload",
+                    "tags": [],
+                    "created_at": Timestamp::now().as_secs()
+                }).to_string()]
+            }),
+        );
+        processor
+            .prepare_response_from_relay(&denied_sign, Some("wss://nos.lol"))
+            .await
+            .unwrap();
+        assert_eq!(runtime_grant.id, grant_summary.id);
+
+        // Member is forbidden from /grants and /diagnostics
+        for path in [
+            format!("/teams/{team_id}/grants"),
+            format!("/teams/{team_id}/diagnostics"),
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri(&path)
+                        .header("host", "example.com")
+                        .header(
+                            AUTHORIZATION_HEADER,
+                            auth_header(
+                                &member,
+                                "GET",
+                                &format!("http://example.com/api{path}"),
+                                &[],
+                            ),
+                        )
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        }
+
+        // Admin receives enriched grants with policy_name, sessions, recent_invitations, recent_drops
+        let grants_path = format!("/teams/{team_id}/grants");
+        let grants_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(&grants_path)
+                    .header("host", "example.com")
+                    .header(
+                        AUTHORIZATION_HEADER,
+                        auth_header(
+                            &admin,
+                            "GET",
+                            &format!("http://example.com/api{grants_path}"),
+                            &[],
+                        ),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(grants_resp.status(), StatusCode::OK);
+        let grants_json: serde_json::Value = serde_json::from_slice(
+            &to_bytes(grants_resp.into_body(), MAX_AUTH_BODY_BYTES)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(grants_json[0]["policy_name"], "Zapstore Releases");
+        assert_eq!(grants_json[0]["stored_key_name"], "Publisher");
+        assert_eq!(grants_json[0]["recent_drops"], 1);
+        assert_eq!(
+            grants_json[0]["sessions"][0]["client_public_key"],
+            client_one.public_key().to_hex()
+        );
+        assert_eq!(grants_json[0]["recent_invitations"][0]["status"], "claimed");
+
+        // Admin receives the secret_already_consumed diagnostic with claiming client pubkey
+        let diag_path = format!("/teams/{team_id}/diagnostics");
+        let diag_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(&diag_path)
+                    .header("host", "example.com")
+                    .header(
+                        AUTHORIZATION_HEADER,
+                        auth_header(
+                            &admin,
+                            "GET",
+                            &format!("http://example.com/api{diag_path}"),
+                            &[],
+                        ),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(diag_resp.status(), StatusCode::OK);
+        let diag_json: serde_json::Value = serde_json::from_slice(
+            &to_bytes(diag_resp.into_body(), MAX_AUTH_BODY_BYTES)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(diag_json[0]["reason_code"], "secret_already_consumed");
+        assert_eq!(
+            diag_json[0]["client_public_key"],
+            client_two.public_key().to_hex()
+        );
+        assert_eq!(
+            diag_json[0]["details"]["claimed_by_client_public_key"],
+            client_one.public_key().to_hex()
+        );
+
+        // Audit response includes details.kind = 24242 and relay_in
+        let audit_path = format!("/teams/{team_id}/audit");
+        let audit_resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(&audit_path)
+                    .header("host", "example.com")
+                    .header(
+                        AUTHORIZATION_HEADER,
+                        auth_header(
+                            &admin,
+                            "GET",
+                            &format!("http://example.com/api{audit_path}"),
+                            &[],
+                        ),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(audit_resp.status(), StatusCode::OK);
+        let audit_json: serde_json::Value = serde_json::from_slice(
+            &to_bytes(audit_resp.into_body(), MAX_AUTH_BODY_BYTES)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let sign_entry = audit_json
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["action"] == "nip46.sign_event")
+            .unwrap();
+        assert_eq!(sign_entry["outcome"], "denied");
+        assert_eq!(sign_entry["reason_code"], "policy_denied");
+        assert_eq!(sign_entry["details"]["kind"], 24242);
+        assert_eq!(sign_entry["details"]["relay_in"], "wss://nos.lol");
+
+        env::remove_var("ALLOWED_PUBKEYS");
+        env::remove_var("KEYCAST_OPERATOR_PUBKEYS");
     }
     include!("hardening_tests.rs");
 }

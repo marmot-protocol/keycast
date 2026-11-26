@@ -48,7 +48,12 @@ export function createCspDirectives(apiUrl) {
         ]),
     );
     if (!apiUrl) return directives;
-    const url = new URL(apiUrl);
+    const trimmed = apiUrl.trim();
+    if (!trimmed) return directives;
+    const withScheme = /^https?:\/\//i.test(trimmed)
+        ? trimmed
+        : `https://${trimmed}`;
+    const url = new URL(withScheme);
     if (url.protocol !== "http:" && url.protocol !== "https:") return directives;
     if (
         url.protocol === "http:" &&
@@ -66,7 +71,9 @@ export function createCspDirectives(apiUrl) {
     return directives;
 }
 
-export const cspDirectives = createCspDirectives(undefined);
+export const cspDirectives = createCspDirectives(
+    typeof process !== "undefined" ? process.env.VITE_DOMAIN : undefined,
+);
 
 /** @param {string} source */
 const formatSource = (source) => {

@@ -60,6 +60,7 @@ test("workspace section links remain shareable and unknown sections default to k
             ).searchParams.get("section"),
         ),
     ).toBe("activity");
+    expect(workspaceSection("connections")).toBe("connections");
     expect(workspaceSection("settings")).toBe("settings");
     expect(workspaceSection(null)).toBe("keys");
     expect(workspaceSection("__proto__")).toBe("keys");

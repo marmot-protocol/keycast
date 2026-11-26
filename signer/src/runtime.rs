@@ -13,7 +13,10 @@ use tokio::sync::{watch, Notify};
 
 use crate::admission::{Admission, Limits, RelayCopies};
 use crate::control::serve_control_socket;
-use crate::protocol::{recipient, validate_outer_event, RequestProcessor, RuntimeMetrics};
+use crate::protocol::{
+    recipient, validate_outer_bounds, validate_outer_event, ProtocolError, RequestProcessor,
+    RuntimeMetrics,
+};
 use crate::store::{Store, StoreError};
 
 #[derive(Clone)]
@@ -26,6 +29,7 @@ pub struct RuntimeState {
             std::collections::BTreeMap<String, crate::relay_diagnostics::RelayDiagnostics>,
         >,
     >,
+    pub grant_diagnostics: Arc<crate::grant_diagnostics::GrantDiagnostics>,
     pub ready: Arc<AtomicBool>,
     pub integrity_ok: Arc<AtomicBool>,
     pub quarantined_grants: Arc<AtomicUsize>,
@@ -54,6 +58,7 @@ impl RuntimeState {
             metrics: Arc::new(RuntimeMetrics::default()),
             connected_relays: Arc::new(AtomicUsize::new(0)),
             relay_diagnostics: Default::default(),
+            grant_diagnostics: Arc::new(crate::grant_diagnostics::GrantDiagnostics::default()),
             ready: Arc::new(AtomicBool::new(false)),
             integrity_ok: Arc::new(AtomicBool::new(true)),
             quarantined_grants: Arc::new(AtomicUsize::new(0)),
@@ -200,6 +205,17 @@ fn relay_result(
     }
 }
 
+struct WorkerOutcome {
+    inflight_key: String,
+    event_id: String,
+    relay: Option<String>,
+    target_hex: String,
+    peer: String,
+    recovered: bool,
+    session_active: Option<bool>,
+    result: Result<Option<nostr::prelude::Event>, ProtocolError>,
+}
+
 /// Shared by the daemon and real-relay integration tests.
 pub async fn relay_supervisor(
     state: RuntimeState,
@@ -214,7 +230,11 @@ pub async fn relay_supervisor(
     let mut telemetry_flush = tokio::time::interval(Duration::from_secs(1));
     let mut pending_telemetry = Vec::new();
     let mut notifications = client.notifications();
-    let processor = RequestProcessor::new(state.store.clone(), state.metrics.clone());
+    let processor = RequestProcessor::with_diagnostics(
+        state.store.clone(),
+        state.metrics.clone(),
+        state.grant_diagnostics.clone(),
+    );
     let mut workers = tokio::task::JoinSet::new();
     let mut worker_events = HashMap::new();
     let mut publishers = tokio::task::JoinSet::<(String, bool, bool)>::new();
@@ -242,10 +262,12 @@ pub async fn relay_supervisor(
     // Events from clients without a live session on the target grant, including
     // every `connect`, draw from their own smaller lane.
     let newcomers = Admission::new(Limits::NEWCOMER);
+    let established_verification = Admission::new(Limits::ESTABLISHED);
     let replay_validation = Admission::default();
     // (remote signer pubkey, client pubkey) pairs with a live session, refreshed
     // with the grant configuration. Bounded by the sessions capacity trigger.
     let mut live_sessions = HashSet::<(String, String)>::new();
+    let mut grant_targets = HashMap::<String, (i64, i64, i64)>::new();
     let mut minimum = 1i64;
     let mut recovery_pending = false;
     let mut delivery_failure: Option<std::time::Instant> = None;
@@ -293,13 +315,16 @@ pub async fn relay_supervisor(
                             }
                             RelayMessage::Event { subscription_id, event } if subscription_id.as_ref() == &subscription => {
                                 let event = event.into_owned();
+                                // Cheap O(1) bounds check (kind, size, timestamp window) before touching
+                                // any admission budget, dedupe map, or diagnostics buffer.
+                                if validate_outer_bounds(&event).is_err() { return Ok(true); }
                                 let id = event.id.to_hex();
                                 let peer = event.pubkey.to_hex();
-                                if event.kind != Kind::NostrConnect { return Ok(true); }
                                 let Ok(target) = recipient(&event) else { return Ok(true); };
                                 if !relay_keys.get(relay_url.as_str().trim_end_matches('/')).is_some_and(|keys|keys.contains(&target)) { return Ok(true); }
                                 let now = std::time::Instant::now();
-                                if relay_copies.redundant(&id, relay_url.as_str(), now) || inflight.contains_key(&id) { return Ok(true); }
+                                let inflight_key = format!("{id}:{}", event.sig);
+                                if relay_copies.redundant(&id, relay_url.as_str(), now) || inflight.contains_key(&inflight_key) { return Ok(true); }
                                 if completed.contains(&id) {
                                     // Bound signature verification itself, including invalid copies
                                     // carrying a known ID. This budget is separate from fresh work.
@@ -323,7 +348,23 @@ pub async fn relay_supervisor(
                                 // addressed to a public remote-signer key must not be able to
                                 // exhaust the capacity that established sessions rely on.
                                 let target_hex = target.to_hex();
-                                let lane = if live_sessions.contains(&(target_hex.clone(), peer.clone())) {
+                                let established = if live_sessions.contains(&(target_hex.clone(), peer.clone())) {
+                                    // Bound signature verification itself on the supervisor loop so
+                                    // spoofed events carrying an established client pubkey cannot
+                                    // monopolize the single relay-supervisor task.
+                                    let Some(_verification) = established_verification.try_admit(&peer, &target_hex) else {
+                                        state.metrics.ingress_rejections.fetch_add(1, Ordering::Relaxed);
+                                        telemetry.record(relay_url.as_str(), "established_verify_throttled");
+                                        return Ok(true);
+                                    };
+                                    if event.verify().is_err() {
+                                        return Ok(true);
+                                    }
+                                    true
+                                } else {
+                                    false
+                                };
+                                let lane = if established {
                                     &admission
                                 } else {
                                     &newcomers
@@ -333,39 +374,110 @@ pub async fn relay_supervisor(
                                     Err(reason) => {
                                         state.metrics.ingress_rejections.fetch_add(1,Ordering::Relaxed);
                                         telemetry.record(relay_url.as_str(), reason);
+                                        if established {
+                                            if let Some(&(grant_id, team_id, stored_key_id)) = grant_targets.get(&target_hex) {
+                                                state.grant_diagnostics.record_drop(
+                                                    team_id,
+                                                    stored_key_id,
+                                                    grant_id,
+                                                    Some(peer.clone()),
+                                                    Some(id.clone()),
+                                                    None,
+                                                    "rate_limited",
+                                                    Some(relay_url.to_string()),
+                                                    serde_json::json!({ "admission_reason": reason }),
+                                                );
+                                            }
+                                        }
                                         return Ok(true);
                                     }
                                 };
-                                relay_copies.admitted(&id, relay_url.as_str(), now);
-                                inflight.insert(id.clone(),std::time::Instant::now());
+                                if established {
+                                    relay_copies.admitted(&id, relay_url.as_str(), now);
+                                }
+                                inflight.insert(inflight_key.clone(),std::time::Instant::now());
                                 let processor = processor.clone();
                                 let store = state.store.clone();
-                                let worker_id = id.clone();
+                                let worker_key = inflight_key.clone();
+                                let relay_str = relay_url.to_string();
                                 let task = workers.spawn(async move {
                                     let _ticket = ticket;
-                                    let result = processor.prepare_response(&event).await;
-                                    if result.is_ok() {
-                                        let _ = store.mark_relay_received(relay_url.as_str(), &id, event.created_at.as_secs() as i64).await;
+                                    let result = processor.prepare_response_from_relay(&event, Some(relay_str.as_str())).await;
+                                    let session_active = if result.is_ok() {
+                                        let _ = store.mark_relay_received(relay_str.as_str(), &id, event.created_at.as_secs() as i64).await;
+                                        store.has_active_session_for_pair(&target_hex, &peer).await.ok()
+                                    } else {
+                                        None
+                                    };
+                                    WorkerOutcome {
+                                        inflight_key: worker_key,
+                                        event_id: id,
+                                        relay: Some(relay_str),
+                                        target_hex,
+                                        peer,
+                                        recovered: false,
+                                        session_active,
+                                        result,
                                     }
-                                    (id, result)
                                 });
-                                worker_events.insert(task.id(), worker_id);
+                                worker_events.insert(task.id(), inflight_key);
                             }
                             _ => {}
                         }
                     }
                 }
                 Some(result) = workers.join_next(), if !workers.is_empty() => {
-                    let (id,result) = match result {
-                        Ok(value) => { worker_events.retain(|_, event_id| event_id != &value.0); value },
+                    let WorkerOutcome {
+                        inflight_key,
+                        event_id: id,
+                        relay: relay_opt,
+                        target_hex,
+                        peer,
+                        recovered,
+                        session_active,
+                        result,
+                    } = match result {
+                        Ok(value) => { worker_events.retain(|_, key| key != &value.inflight_key); value },
                         Err(error) => {
-                            if let Some(id) = worker_events.remove(&error.id()) { inflight.remove(&id); relay_copies.forget(&id); }
+                            if let Some(key) = worker_events.remove(&error.id()) {
+                                inflight.remove(&key);
+                                if let Some((event_id, _)) = key.split_once(':') {
+                                    relay_copies.forget(event_id);
+                                }
+                            }
                             tracing::error!("request worker panicked; durable input retained for retry");
                             return Ok(true);
                         }
                     };
-                    inflight.remove(&id);
-                    if result.is_err() { relay_copies.forget(&id); }
+                    inflight.remove(&inflight_key);
+                    if result.is_err() {
+                        relay_copies.forget(&id);
+                        if recovered {
+                            let terminal_reason = match &result {
+                                Err(ProtocolError::InvalidEvent) => Some("invalid_event"),
+                                Err(ProtocolError::EventTooLarge) => Some("event_too_large"),
+                                Err(ProtocolError::InvalidRecipient) => Some("invalid_recipient"),
+                                Err(ProtocolError::UnknownGrant) => Some("unknown_grant"),
+                                Err(ProtocolError::Decrypt) => Some("decrypt_failed"),
+                                Err(ProtocolError::Malformed) => Some("malformed_request"),
+                                _ => None,
+                            };
+                            if let Some(reason) = terminal_reason {
+                                let _ = state.store.fail_pending_input(&id, reason).await;
+                            }
+                        }
+                    } else {
+                        if let Some(ref relay_str) = relay_opt {
+                            relay_copies.admitted(&id, relay_str.as_str(), std::time::Instant::now());
+                        }
+                        if let Some(active) = session_active {
+                            if active {
+                                live_sessions.insert((target_hex, peer));
+                            } else {
+                                live_sessions.remove(&(target_hex, peer));
+                            }
+                        }
+                    }
                     if matches!(&result, Ok(Some(_))) && completed.len() < 10000 { completed.insert(id.clone()); }
                     retry.reset_immediately();
                     match result {
@@ -429,6 +541,10 @@ pub async fn relay_supervisor(
                     completed = sqlx::query_scalar::query_scalar::<_, String>("SELECT event_id FROM processed_requests WHERE response_event_json IS NOT NULL ORDER BY received_at DESC LIMIT 10000")
                         .fetch_all(&state.store.pool).await?.into_iter().collect();
                     let grants = state.store.active_grants().await?;
+                    grant_targets = grants
+                        .iter()
+                        .map(|g| (g.remote_signer_public_key.clone(), (g.id, g.team_id, g.stored_key_id)))
+                        .collect();
                     live_sessions = sqlx::query_as::query_as::<_, (String, String)>(
                         "SELECT g.remote_signer_public_key,s.client_public_key FROM sessions s JOIN grants g ON g.id=s.grant_id WHERE s.ended_at IS NULL AND g.revoked_at IS NULL AND (g.expires_at IS NULL OR g.expires_at>unixepoch())")
                         .fetch_all(&state.store.pool).await?.into_iter().collect();
@@ -445,6 +561,9 @@ pub async fn relay_supervisor(
                                     desired_keys.entry(url).or_default().insert(key);
                                 }
                             } }
+                            Err(StoreError::NotFound) => {
+                                // Naturally expired between active_grants() and validation; do not quarantine.
+                            }
                             Err(_) => { quarantined += 1; tracing::warn!(grant_id=grant.id,"grant quarantined: invalid policy or key envelope"); }
                         }
                     }
@@ -513,15 +632,37 @@ pub async fn relay_supervisor(
                         if workers.len() >= 32 { break; }
                         if let Ok(event) = Event::from_json(json) {
                             let id = event.id.to_hex();
-                            if inflight.contains_key(&id) { continue; }
+                            let inflight_key = format!("{id}:{}", event.sig);
+                            if inflight.contains_key(&inflight_key) { continue; }
                             let Ok(target) = recipient(&event) else { continue; };
                             if !subscribed_keys.contains(&target) { continue; }
-                            let Some(ticket) = admission.try_admit(&event.pubkey.to_hex(), &target.to_hex()) else { continue; };
-                            inflight.insert(id.clone(),std::time::Instant::now());
+                            let target_hex = target.to_hex();
+                            let peer = event.pubkey.to_hex();
+                            let Some(ticket) = admission.try_admit(&peer, &target_hex) else { continue; };
+                            inflight.insert(inflight_key.clone(),std::time::Instant::now());
                             let processor = processor.clone();
-                            let worker_id = id.clone();
-                            let task = workers.spawn(async move { let _ticket=ticket; let result=processor.prepare_response(&event).await; (id,result) });
-                            worker_events.insert(task.id(), worker_id);
+                            let store = state.store.clone();
+                            let worker_key = inflight_key.clone();
+                            let task = workers.spawn(async move {
+                                let _ticket = ticket;
+                                let result = processor.prepare_response(&event).await;
+                                let session_active = if result.is_ok() {
+                                    store.has_active_session_for_pair(&target_hex, &peer).await.ok()
+                                } else {
+                                    None
+                                };
+                                WorkerOutcome {
+                                    inflight_key: worker_key,
+                                    event_id: id,
+                                    relay: None,
+                                    target_hex,
+                                    peer,
+                                    recovered: true,
+                                    session_active,
+                                    result,
+                                }
+                            });
+                            worker_events.insert(task.id(), inflight_key);
                         }
                     }
                     state.configuration_reloads.fetch_add(1, Ordering::Relaxed);
@@ -531,8 +672,11 @@ pub async fn relay_supervisor(
                     discovery_jobs.spawn(async move { tokio::time::timeout(Duration::from_secs(90),crate::discovery::poll(&store)).await });
                 }
                 Some(result)=discovery_jobs.join_next(), if !discovery_jobs.is_empty() => {
-                    if !matches!(result,Ok(Ok(Ok(())))) { tracing::warn!("relay discovery incomplete; retry scheduled"); }
-                    refresh.reset_immediately();
+                    match result {
+                        Ok(Ok(Ok(true))) => refresh.reset_immediately(),
+                        Ok(Ok(Ok(false))) => {}
+                        _ => tracing::warn!("relay discovery incomplete; retry scheduled"),
+                    }
                 }
                 _ = state.reload.notified() => { refresh.reset_immediately(); }
                 _ = prune.tick() => { state.store.prune_requests().await?; }

@@ -65,7 +65,11 @@ export class KeycastApi {
                 }
                 const plaintext = nip44.decrypt(envelope.encrypted_response, nip44.utils.getConversationKey(pending.secret, pending.replyKey));
                 const reply = JSON.parse(plaintext) as { status: number; body: string };
-                response = new Response(reply.status === 204 ? null : reply.body, { status: reply.status });
+                if (!Number.isInteger(reply.status) || reply.status < 200 || reply.status > 599) {
+                    throw new Error("Invalid decrypted management reply status");
+                }
+                const nullBody = reply.status === 204 || reply.status === 205 || reply.status === 304;
+                response = new Response(nullBody ? null : reply.body, { status: reply.status });
             }
         } finally {
             pending?.secret.fill(0);
@@ -163,24 +167,23 @@ export class KeycastApi {
         if (!config.instance_id || !Number.isSafeInteger(config.authority_revision)) throw new Error("Signer management configuration is unavailable");
         unsignedAuthEvent.tags.push(["instance", config.instance_id]);
         let replyKey = "";
-        if (write) {
-            replyKey = verifyManagementReplyKey(config.management_reply_public_key);
-            responseSecret = generateSecretKey();
-            const nonce = Array.from(crypto.getRandomValues(new Uint8Array(32)), b => b.toString(16).padStart(2,"0")).join("");
-            unsignedAuthEvent.kind = MANAGEMENT_KIND;
-            unsignedAuthEvent.content = managementDescription(method, url, body ?? "");
-            // Refuse before asking the key store to sign. The approval is shown by,
-            // stored in, and for NIP-46 relayed to an external signer.
-            if (containsSecretMarker(unsignedAuthEvent.content)) {
-                responseSecret.fill(0);
-                throw new Error(
-                    "This change cannot be approved because its description would contain private key material. Remove the key material from the name and try again.",
-                );
-            }
-            unsignedAuthEvent.tags = unsignedAuthEvent.tags.filter(t => t[0] !== "payload");
-            unsignedAuthEvent.tags.push(["payload", await sha256Hex(body ?? "")], ["revision", String(config.authority_revision)], ["nonce", nonce], ["response", getPublicKey(responseSecret)]);
-        }
         try {
+            if (write) {
+                replyKey = verifyManagementReplyKey(config.management_reply_public_key);
+                responseSecret = generateSecretKey();
+                const nonce = Array.from(crypto.getRandomValues(new Uint8Array(32)), b => b.toString(16).padStart(2,"0")).join("");
+                unsignedAuthEvent.kind = MANAGEMENT_KIND;
+                unsignedAuthEvent.content = managementDescription(method, url, body ?? "");
+                // Refuse before asking the key store to sign. The approval is shown by,
+                // stored in, and for NIP-46 relayed to an external signer.
+                if (containsSecretMarker(unsignedAuthEvent.content)) {
+                    throw new Error(
+                        "This change cannot be approved because its description would contain private key material. Remove the key material from the name and try again.",
+                    );
+                }
+                unsignedAuthEvent.tags = unsignedAuthEvent.tags.filter(t => t[0] !== "payload");
+                unsignedAuthEvent.tags.push(["payload", await sha256Hex(body ?? "")], ["revision", String(config.authority_revision)], ["nonce", nonce], ["response", getPublicKey(responseSecret)]);
+            }
             unsignedAuthEvent.created_at = Math.floor(Date.now() / 1000);
             const signedAuthEvent = await signNostrEvent(unsignedAuthEvent, pubkey);
             const header = `Nostr ${base64Json(signedAuthEvent)}`;

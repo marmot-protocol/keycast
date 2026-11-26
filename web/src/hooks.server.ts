@@ -16,7 +16,11 @@ function applySecurityHeaders(response: Response, event: Parameters<Handle>[0]["
     response.headers.set("Cross-Origin-Resource-Policy", "same-origin");
     response.headers.set("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
 
-    const forwardedProto = event.request.headers.get("x-forwarded-proto");
+    const forwardedProto = event.request.headers
+        .get("x-forwarded-proto")
+        ?.split(",")[0]
+        ?.trim()
+        .toLowerCase();
     if (event.url.protocol === "https:" || forwardedProto === "https") {
         response.headers.set(
             "Strict-Transport-Security",
@@ -27,7 +31,8 @@ function applySecurityHeaders(response: Response, event: Parameters<Handle>[0]["
 
 export const handle: Handle = async ({ event, resolve }) => {
     const sessionCookie = event.cookies.get("keycastUserPubkey");
-    if (!sessionCookie && isProtectedRoute(event.url.pathname)) {
+    const hasValidSession = typeof sessionCookie === "string" && /^[0-9a-f]{64}$/.test(sessionCookie);
+    if (!hasValidSession && isProtectedRoute(event.url.pathname)) {
         const response = new Response(null, {
             status: 303,
             headers: { Location: `/?${new URLSearchParams({ returnTo: event.url.pathname + event.url.search })}` },

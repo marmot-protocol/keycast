@@ -42,7 +42,8 @@ services:
       target: signer-runtime
     volumes:
       # Set KEYCAST_STATE_DIR to keep persistent state and the root credential
-      # outside the checkout, e.g. /srv/keycast. Defaults to the checkout.
+      # outside tracked database/migrations (scripts/init.sh writes ./state by
+      # default). Omitting KEYCAST_STATE_DIR falls back to "." for existing upgrades.
       - ${KEYCAST_STATE_DIR:-.}/database:/app/database:rw
       - keycast-runtime:/run/keycast:rw
       - ${KEYCAST_STATE_DIR:-.}/master.key:/run/secrets/keycast-root-key:ro

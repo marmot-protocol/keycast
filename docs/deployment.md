@@ -11,7 +11,7 @@ and web UI. SQLite and the root credential live on the host; only the signer mou
 - A hostname with DNS pointing to the host, and HTTPS access through a reverse proxy.
 - Outbound connectivity to your signing relays.
 - An external Nostr signer for each management identity, and the identities' public keys in
-  64-character hex format for configuration.
+  64-character hex or Bech32 `npub1...` format for configuration.
 - Reviewed images for all three services, or a source checkout you intend to build.
 
 Run the commands below from the repository root. If you already have an instance, follow
@@ -35,9 +35,7 @@ bash scripts/init.sh \
   --operator-pubkeys "YOUR_64_CHARACTER_HEX_PUBKEY"
 ```
 
-To keep persistent state outside the checkout, add `--state-dir /srv/keycast` (the invoking
-account needs permission to create that directory). This is saved as `KEYCAST_STATE_DIR` in `.env`.
-Without it, state defaults to the checkout.
+By default, `scripts/init.sh` stores persistent state under `./state` (so tracked `database/migrations/` is never modified) and saves `KEYCAST_STATE_DIR=./state` in `.env`. To keep persistent state outside the checkout, pass `--state-dir /srv/keycast` (the invoking account needs permission to create that directory). Existing deployments whose `.env` omits `KEYCAST_STATE_DIR` continue to default to the checkout.
 
 The script creates `.env`, a private `database/` directory, and a 32-byte root credential in
 `master.key` if one is absent. It refuses to overwrite `.env` or regenerate an existing root key.
@@ -52,9 +50,9 @@ Configuration in [`.env.example`](../.env.example):
 
 | Setting | Meaning |
 |---|---|
-| `KEYCAST_STATE_DIR` | Host directory containing `database/` and `master.key`; defaults to the checkout. Use an absolute external path to separate live state from source. |
+| `KEYCAST_STATE_DIR` | Host directory containing `database/` and `master.key`. `scripts/init.sh` sets `./state` for new installs; omitting it falls back to the checkout for legacy upgrades. Use an absolute external path like `/srv/keycast` to separate live state from source. |
 | `DOMAIN` | Public hostname, without scheme or path. Compose derives the HTTPS API URL and web origin. |
-| `ALLOWED_PUBKEYS` | Comma-separated hex public keys admitted to management. Empty configuration denies access. |
+| `ALLOWED_PUBKEYS` | Comma-separated 64-character hex or `npub1...` public keys admitted to management. Empty configuration denies access. |
 | `KEYCAST_OPERATOR_PUBKEYS` | Identities allowed to inspect instance status and change global relays. These identities also need admission. Initialization defaults to the first allowed key if omitted. |
 | `KEYCAST_API_IMAGE`, `KEYCAST_SIGNER_IMAGE`, `KEYCAST_WEB_IMAGE` | Registry image names; defaults are the three Keycast packages under `ghcr.io/marmot-protocol`. |
 | `KEYCAST_API_DIGEST`, `KEYCAST_SIGNER_DIGEST`, `KEYCAST_WEB_DIGEST` | Separate reviewed `sha256:…` manifest digests, required by production Compose. |
@@ -95,8 +93,9 @@ gh attestation verify oci://ghcr.io/marmot-protocol/keycast-signer@sha256:CHOSEN
   --signer-workflow marmot-protocol/keycast/.github/workflows/docker.yml
 ```
 
-Repeat for API and web. Install GitHub CLI before preflight: verification errors fail preflight,
-but an absent CLI produces only a warning. Do not use historical VM reports to select a release.
+Repeat for API and web. Install GitHub CLI before preflight: provenance verification is blocking
+(both verification failures and a missing `gh` binary fail preflight unless `--skip-provenance` is
+passed explicitly). Do not use historical VM reports to select a release.
 
 ```sh
 sudo scripts/upgrade_preflight.sh --fix-permissions

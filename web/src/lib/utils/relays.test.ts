@@ -7,11 +7,11 @@ import {
 const DEAD_RELAYS = [
     ["relay", "nsec" + "bunker", "com"].join("."),
     ["relay", "nostr", "band"].join("."),
+    "relay.damus.io",
 ];
 const REQUIRED_RELAYS = [
     "wss://nos.lol",
     "wss://relay.primal.net",
-    "wss://relay.damus.io",
 ] as const;
 
 describe("relay defaults", () => {

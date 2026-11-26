@@ -44,12 +44,12 @@
         loading="lazy"
         decoding="async"
         onerror={() => (failed = true)}
-        class="object-cover rounded-sm shrink-0 {extraClasses}"
+        class="object-cover rounded-md border border-line shrink-0 {extraClasses}"
     />
 {:else}
     <span
         aria-hidden="true"
-        class="inline-grid place-items-center rounded-sm shrink-0 bg-accent/10 text-accent font-mono text-xs {extraClasses}"
+        class="inline-grid place-items-center rounded-md border border-line shrink-0 bg-accent/10 text-accent font-mono text-xs font-medium {extraClasses}"
         >{pubkey.slice(0, 2).toUpperCase()}</span
     >
 {/if}

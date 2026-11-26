@@ -2,7 +2,7 @@
 
 This file inherits the root guidance and applies to `web/`.
 
-- `VITE_*` config is public. Never put credentials or managed private keys in browser storage.
+- `VITE_*` config is public. Never put managed private keys or persistent credentials in `localStorage`. Paired NIP-46 bunker client sessions may use tab-scoped `sessionStorage` with a bounded TTL and explicit sign-out cleanup/zeroization so page reloads do not force re-pairing.
 - The pubkey cookie and config check are UI hints; signer authorization is authoritative.
 - Keep NIP-98 payload hashes byte-for-byte aligned with the body sent.
 - Keep policy/grant TypeScript shapes synchronized with Rust and reject incomplete forms.

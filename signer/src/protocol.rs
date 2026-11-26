@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
+use crate::grant_diagnostics::GrantDiagnostics;
 use crate::store::{RuntimeGrant, Store, StoreError};
 
 const MAX_EVENT_CONTENT_BYTES: usize = 256 * 1024;
@@ -36,6 +37,7 @@ pub struct RuntimeMetrics {
 pub struct RequestProcessor {
     store: Store,
     metrics: Arc<RuntimeMetrics>,
+    diagnostics: Arc<GrantDiagnostics>,
     replications: Arc<std::sync::Mutex<tokio::task::JoinSet<()>>>,
 }
 
@@ -68,7 +70,15 @@ pub enum ProtocolError {
 struct RequestWire {
     id: String,
     method: String,
+    #[serde(deserialize_with = "deserialize_params")]
     params: Vec<String>,
+}
+
+fn deserialize_params<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Vec<String>>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 #[derive(Debug, Serialize)]
@@ -87,6 +97,7 @@ struct Execution {
     reason: Option<&'static str>,
     session_id: Option<i64>,
     logout_after_publish: bool,
+    details: serde_json::Map<String, Value>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,6 +115,7 @@ impl Execution {
             reason: None,
             session_id,
             logout_after_publish: false,
+            details: serde_json::Map::new(),
         }
     }
 
@@ -115,15 +127,30 @@ impl Execution {
             reason: Some(reason),
             session_id,
             logout_after_publish: false,
+            details: serde_json::Map::new(),
         }
+    }
+
+    fn with_detail(mut self, key: &str, value: Value) -> Self {
+        self.details.insert(key.to_string(), value);
+        self
     }
 }
 
 impl RequestProcessor {
     pub fn new(store: Store, metrics: Arc<RuntimeMetrics>) -> Self {
+        Self::with_diagnostics(store, metrics, Arc::new(GrantDiagnostics::default()))
+    }
+
+    pub fn with_diagnostics(
+        store: Store,
+        metrics: Arc<RuntimeMetrics>,
+        diagnostics: Arc<GrantDiagnostics>,
+    ) -> Self {
         Self {
             store,
             metrics,
+            diagnostics,
             replications: Arc::default(),
         }
     }
@@ -154,25 +181,93 @@ impl RequestProcessor {
         Ok(())
     }
     pub async fn prepare_response(&self, event: &Event) -> Result<Option<Event>, ProtocolError> {
+        self.prepare_response_from_relay(event, None).await
+    }
+
+    pub async fn prepare_response_from_relay(
+        &self,
+        event: &Event,
+        relay_url: Option<&str>,
+    ) -> Result<Option<Event>, ProtocolError> {
         validate_outer_event(event)?;
         let remote_pubkey = recipient(event)?;
-        let _authority = self.store.authority.lock().await;
-        let grant = self
+        let remote_hex = remote_pubkey.to_hex();
+        // Decrypt and validate the untrusted envelope before taking the authority
+        // lock so unauthenticated traffic cannot serialize live sessions or
+        // management mutations.
+        let initial_grant = self
             .store
-            .grant_for_recipient(&remote_pubkey.to_hex())
+            .grant_for_recipient(&remote_hex)
             .await?
             .ok_or(ProtocolError::UnknownGrant)?;
-        let remote_keys = self.store.decrypt_remote_keys(&grant)?;
+        let remote_keys = self.store.decrypt_remote_keys(&initial_grant)?;
         let plaintext = nip44::decrypt(remote_keys.secret_key(), &event.pubkey, &event.content)
-            .map_err(|_| ProtocolError::Decrypt)?;
+            .map_err(|_| {
+                self.diagnostics.record_drop(
+                    initial_grant.team_id,
+                    initial_grant.stored_key_id,
+                    initial_grant.id,
+                    Some(event.pubkey.to_hex()),
+                    Some(event.id.to_hex()),
+                    None,
+                    "decrypt_failed",
+                    relay_url.map(str::to_owned),
+                    serde_json::json!({}),
+                );
+                ProtocolError::Decrypt
+            })?;
         if plaintext.len() > MAX_EVENT_CONTENT_BYTES {
+            self.diagnostics.record_drop(
+                initial_grant.team_id,
+                initial_grant.stored_key_id,
+                initial_grant.id,
+                Some(event.pubkey.to_hex()),
+                Some(event.id.to_hex()),
+                None,
+                "event_too_large",
+                relay_url.map(str::to_owned),
+                serde_json::json!({}),
+            );
             return Err(ProtocolError::EventTooLarge);
         }
         let request: RequestWire = serde_json::from_str(&plaintext).map_err(|_| {
             self.metrics.parse_errors.fetch_add(1, Ordering::Relaxed);
+            self.diagnostics.record_drop(
+                initial_grant.team_id,
+                initial_grant.stored_key_id,
+                initial_grant.id,
+                Some(event.pubkey.to_hex()),
+                Some(event.id.to_hex()),
+                None,
+                "malformed_request",
+                relay_url.map(str::to_owned),
+                serde_json::json!({}),
+            );
             ProtocolError::Malformed
         })?;
-        validate_request(&request)?;
+        if let Err(err) = validate_request(&request) {
+            self.diagnostics.record_drop(
+                initial_grant.team_id,
+                initial_grant.stored_key_id,
+                initial_grant.id,
+                Some(event.pubkey.to_hex()),
+                Some(event.id.to_hex()),
+                Some(request.method.as_str()),
+                "malformed_request",
+                relay_url.map(str::to_owned),
+                serde_json::json!({}),
+            );
+            return Err(err);
+        }
+
+        // Exclusive authority lock serializes request dedupe, execution, caching,
+        // and management mutations (decryption and parsing already ran unlocked above).
+        let _authority = self.store.authority.lock().await;
+        let grant = self
+            .store
+            .grant_for_recipient(&remote_hex)
+            .await?
+            .ok_or(ProtocolError::UnknownGrant)?;
 
         let current_session = if request.method == "connect" {
             None
@@ -180,14 +275,36 @@ impl RequestProcessor {
             self.store.active_session(grant.id, &event.pubkey).await?
         };
 
-        if request.method == "connect"
-            && (request.params.len() < 2
-                || !self
-                    .store
+        if request.method == "connect" {
+            let can = if request.params.len() < 2 {
+                false
+            } else {
+                self.store
                     .can_connect(grant.id, &event.pubkey, &request.params[1])
-                    .await?)
-        {
-            return Err(ProtocolError::Malformed);
+                    .await?
+            };
+            if !can {
+                let (reason_code, details) = if request.params.len() < 2 {
+                    ("secret_missing", serde_json::json!({}))
+                } else {
+                    self.store
+                        .diagnose_connect_rejection(grant.id, &request.params[1])
+                        .await
+                        .unwrap_or(("secret_mismatch", serde_json::json!({})))
+                };
+                self.diagnostics.record_drop(
+                    grant.team_id,
+                    grant.stored_key_id,
+                    grant.id,
+                    Some(event.pubkey.to_hex()),
+                    Some(event.id.to_hex()),
+                    Some("connect"),
+                    reason_code,
+                    relay_url.map(str::to_owned),
+                    details,
+                );
+                return Err(ProtocolError::Malformed);
+            }
         }
 
         if let Some(cached) = self
@@ -202,6 +319,17 @@ impl RequestProcessor {
         }
 
         if request.method != "connect" && current_session.is_none() {
+            self.diagnostics.record_drop(
+                grant.team_id,
+                grant.stored_key_id,
+                grant.id,
+                Some(event.pubkey.to_hex()),
+                Some(event.id.to_hex()),
+                Some(request.method.as_str()),
+                "no_active_session",
+                relay_url.map(str::to_owned),
+                serde_json::json!({}),
+            );
             return Err(ProtocolError::UnknownGrant);
         }
 
@@ -238,6 +366,7 @@ impl RequestProcessor {
             Err(error) => return Err(error.into()),
         }
 
+        let current_session_id = current_session.as_ref().map(|session| session.id);
         let execution = self
             .execute(
                 &grant,
@@ -257,7 +386,7 @@ impl RequestProcessor {
                     error = %error,
                     "NIP-46 request failed safely"
                 );
-                Execution::denied("request failed", "operation_failed", None)
+                Execution::denied("request failed", "operation_failed", current_session_id)
             }
         };
 
@@ -288,6 +417,12 @@ impl RequestProcessor {
         if !execution.approved {
             self.metrics.denied_requests.fetch_add(1, Ordering::Relaxed);
         }
+        if let Some(relay_url) = relay_url {
+            execution
+                .details
+                .insert("relay_in".to_string(), Value::String(relay_url.to_string()));
+        }
+        let details_json = Value::Object(execution.details).to_string();
         let response_json = response.as_json();
         self.store
             .cache_response(
@@ -296,6 +431,7 @@ impl RequestProcessor {
                 &response_json,
                 execution.approved,
                 execution.reason,
+                &details_json,
                 execution.logout_after_publish,
             )
             .await?;
@@ -446,18 +582,21 @@ impl RequestProcessor {
         };
         let requested =
             RequestedCapabilities::from_json(session.requested_capabilities.as_deref())?;
-        if !policy.allows_sign_event(unsigned.kind.as_u16(), &requested) {
+        let requested_kind = unsigned.kind.as_u16();
+        if !policy.allows_sign_event(requested_kind, &requested) {
             return Ok(Execution::denied(
                 "policy denied request",
                 "policy_denied",
                 Some(session.id),
-            ));
+            )
+            .with_detail("kind", Value::from(requested_kind)));
         }
         let keys = self.store.decrypt_stored_keys(grant)?;
         let signed = unsigned
             .finalize(&keys)
             .map_err(|e| StoreError::InvalidInput(e.to_string()))?;
-        Ok(Execution::success(signed.as_json(), Some(session.id)))
+        Ok(Execution::success(signed.as_json(), Some(session.id))
+            .with_detail("kind", Value::from(requested_kind)))
     }
 
     async fn crypto(
@@ -496,6 +635,11 @@ impl RequestProcessor {
         };
         let requested =
             RequestedCapabilities::from_json(session.requested_capabilities.as_deref())?;
+        let recipient_scope = if recipient == user_pubkey {
+            "self"
+        } else {
+            "other"
+        };
         if !policy.allows_crypto(
             request.method.as_str(),
             &recipient,
@@ -506,7 +650,8 @@ impl RequestProcessor {
                 "policy denied request",
                 "policy_denied",
                 Some(session.id),
-            ));
+            )
+            .with_detail("recipient_scope", Value::from(recipient_scope)));
         }
         let keys = self.store.decrypt_stored_keys(grant)?;
         let result = match request.method.as_str() {
@@ -522,12 +667,14 @@ impl RequestProcessor {
             _ => unreachable!(),
         };
         match result {
-            Ok(result) => Ok(Execution::success(result, Some(session.id))),
+            Ok(result) => Ok(Execution::success(result, Some(session.id))
+                .with_detail("recipient_scope", Value::from(recipient_scope))),
             Err(_) => Ok(Execution::denied(
                 "cryptographic operation failed",
                 "crypto_failed",
                 Some(session.id),
-            )),
+            )
+            .with_detail("recipient_scope", Value::from(recipient_scope))),
         }
     }
 
@@ -656,14 +803,13 @@ impl RequestProcessor {
     }
 }
 
-pub(crate) fn validate_outer_event(event: &Event) -> Result<(), ProtocolError> {
+pub(crate) fn validate_outer_bounds(event: &Event) -> Result<(), ProtocolError> {
     if event.kind != Kind::NostrConnect
         || event.content.len() > MAX_EVENT_CONTENT_BYTES
         || event.as_json().len() > MAX_EVENT_CONTENT_BYTES + 4096
     {
         return Err(ProtocolError::EventTooLarge);
     }
-    event.verify().map_err(|_| ProtocolError::InvalidEvent)?;
     let now = Timestamp::now().as_secs();
     let created_at = event.created_at.as_secs();
     if created_at.saturating_add(MAX_REQUEST_AGE_SECONDS) < now
@@ -671,6 +817,12 @@ pub(crate) fn validate_outer_event(event: &Event) -> Result<(), ProtocolError> {
     {
         return Err(ProtocolError::InvalidEvent);
     }
+    Ok(())
+}
+
+pub(crate) fn validate_outer_event(event: &Event) -> Result<(), ProtocolError> {
+    validate_outer_bounds(event)?;
+    event.verify().map_err(|_| ProtocolError::InvalidEvent)?;
     Ok(())
 }
 
@@ -958,5 +1110,28 @@ mod tests {
             parse_sign_event_template(&signed.to_string(), &user),
             Err(SignEventTemplateError::Invalid)
         );
+    }
+
+    #[test]
+    fn request_wire_accepts_null_params_as_empty_list_for_nak_switch_relays() {
+        let parsed: RequestWire = serde_json::from_str(
+            r#"{"id":"nl-1-switch_relays","method":"switch_relays","params":null}"#,
+        )
+        .expect("null params should deserialize as empty list");
+        assert_eq!(parsed.id, "nl-1-switch_relays");
+        assert_eq!(parsed.method, "switch_relays");
+        assert!(parsed.params.is_empty());
+        assert!(validate_request(&parsed).is_ok());
+
+        // Non-array/non-null params and missing params must still fail closed.
+        assert!(
+            serde_json::from_str::<RequestWire>(r#"{"id":"1","method":"ping","params":{}}"#)
+                .is_err()
+        );
+        assert!(
+            serde_json::from_str::<RequestWire>(r#"{"id":"1","method":"ping","params":123}"#)
+                .is_err()
+        );
+        assert!(serde_json::from_str::<RequestWire>(r#"{"id":"1","method":"ping"}"#).is_err());
     }
 }

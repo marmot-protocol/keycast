@@ -48,6 +48,10 @@ pub enum RecipientScope {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestedCapabilities(Option<BTreeSet<String>>);
 
+const MAX_ALLOWED_KINDS: usize = 1024;
+const MAX_REQUESTED_CAPABILITIES_BYTES: usize = 4096;
+const MAX_REQUESTED_CAPABILITIES_COUNT: usize = 128;
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum PolicyError {
     #[error("unsupported policy version")]
@@ -56,6 +60,10 @@ pub enum PolicyError {
     Empty,
     #[error("sign_event.allowed_kinds must contain at least one kind")]
     EmptyKinds,
+    #[error("sign_event.allowed_kinds exceeds the maximum allowed count")]
+    TooManyKinds,
+    #[error("sign_event.allowed_kinds must not include reserved Keycast management kinds")]
+    ReservedManagementKind,
     #[error("sign_event.allowed_kinds contains a duplicate kind")]
     DuplicateKind,
     #[error("invalid requested capability: {0}")]
@@ -91,12 +99,31 @@ impl PolicyDocument {
             if sign.allowed_kinds.is_empty() {
                 return Err(PolicyError::EmptyKinds);
             }
+            if sign.allowed_kinds.len() > MAX_ALLOWED_KINDS {
+                return Err(PolicyError::TooManyKinds);
+            }
             let unique: BTreeSet<u16> = sign.allowed_kinds.iter().copied().collect();
             if unique.len() != sign.allowed_kinds.len() {
                 return Err(PolicyError::DuplicateKind);
             }
         }
 
+        Ok(())
+    }
+
+    /// Strict validation for management writes (creating or updating policies).
+    /// Existing stored rows continue to hard-deny reserved management kinds in
+    /// [`Self::allows_sign_event`], while new writes reject them up front.
+    pub fn validate_for_write(&self) -> Result<(), PolicyError> {
+        self.validate()?;
+        if let Some(sign) = &self.capabilities.sign_event {
+            if sign.allowed_kinds.iter().any(|&kind| {
+                kind == super::management::MANAGEMENT_KIND
+                    || kind == super::management::MANAGEMENT_READ_KIND
+            }) {
+                return Err(PolicyError::ReservedManagementKind);
+            }
+        }
         Ok(())
     }
 
@@ -141,10 +168,18 @@ impl RequestedCapabilities {
         let Some(raw) = raw.filter(|value| !value.trim().is_empty()) else {
             return Ok(Self::unrestricted());
         };
+        if raw.len() > MAX_REQUESTED_CAPABILITIES_BYTES {
+            return Err(PolicyError::InvalidRequestedCapability(
+                "requested capabilities exceed size limit".into(),
+            ));
+        }
 
         let mut capabilities = BTreeSet::new();
         for value in raw.split(',').map(str::trim) {
-            if !is_valid_requested_capability(value) || !capabilities.insert(value.to_owned()) {
+            if capabilities.len() >= MAX_REQUESTED_CAPABILITIES_COUNT
+                || !is_valid_requested_capability(value)
+                || !capabilities.insert(value.to_owned())
+            {
                 return Err(PolicyError::InvalidRequestedCapability(value.to_owned()));
             }
         }
@@ -157,10 +192,18 @@ impl RequestedCapabilities {
         };
         let values: Vec<String> =
             serde_json::from_str(json).map_err(|e| PolicyError::InvalidJson(e.to_string()))?;
-        if values.is_empty() {
-            return Ok(Self(Some(BTreeSet::new())));
+        if values.len() > MAX_REQUESTED_CAPABILITIES_COUNT {
+            return Err(PolicyError::InvalidRequestedCapability(
+                "requested capabilities exceed count limit".into(),
+            ));
         }
-        Self::parse(Some(&values.join(",")))
+        let mut capabilities = BTreeSet::new();
+        for value in values {
+            if !is_valid_requested_capability(&value) || !capabilities.insert(value.clone()) {
+                return Err(PolicyError::InvalidRequestedCapability(value));
+            }
+        }
+        Ok(Self(Some(capabilities)))
     }
 
     pub fn as_json(&self) -> Result<Option<String>, serde_json::Error> {
@@ -188,9 +231,12 @@ fn is_valid_requested_capability(value: &str) -> bool {
     matches!(
         value,
         "sign_event" | "nip04_encrypt" | "nip04_decrypt" | "nip44_encrypt" | "nip44_decrypt"
-    ) || value
-        .strip_prefix("sign_event:")
-        .is_some_and(|kind| kind.parse::<u16>().is_ok())
+    ) || value.strip_prefix("sign_event:").is_some_and(|kind| {
+        kind.bytes().all(|b| b.is_ascii_digit())
+            && kind
+                .parse::<u16>()
+                .is_ok_and(|parsed| parsed.to_string() == kind)
+    })
 }
 
 #[cfg(test)]
@@ -236,6 +282,36 @@ mod tests {
         assert!(RequestedCapabilities::parse(Some("sign_event,sign_event")).is_err());
         assert!(RequestedCapabilities::parse(Some("admin")).is_err());
         assert!(RequestedCapabilities::parse(Some("sign_event:70000")).is_err());
+        assert!(RequestedCapabilities::parse(Some("sign_event:+1")).is_err());
+        assert!(RequestedCapabilities::parse(Some("sign_event:0001")).is_err());
+        assert!(RequestedCapabilities::from_json(Some(r#"[""]"#)).is_err());
+        assert!(RequestedCapabilities::from_json(Some(r#"["   "]"#)).is_err());
+        assert_eq!(
+            PolicyDocument {
+                version: 1,
+                capabilities: Capabilities {
+                    sign_event: Some(SignEventCapability {
+                        allowed_kinds: vec![super::super::management::MANAGEMENT_KIND],
+                    }),
+                    ..Capabilities::default()
+                },
+            }
+            .validate_for_write(),
+            Err(PolicyError::ReservedManagementKind)
+        );
+        assert_eq!(
+            PolicyDocument {
+                version: 1,
+                capabilities: Capabilities {
+                    sign_event: Some(SignEventCapability {
+                        allowed_kinds: (0..=1024u16).collect(),
+                    }),
+                    ..Capabilities::default()
+                },
+            }
+            .validate(),
+            Err(PolicyError::TooManyKinds)
+        );
     }
 
     fn policy_with_no_capabilities() -> PolicyDocument {

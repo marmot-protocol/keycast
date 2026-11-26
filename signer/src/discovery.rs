@@ -210,15 +210,34 @@ impl Store {
     }
 }
 
-pub async fn poll(store: &Store) -> Result<(), StoreError> {
+pub async fn poll(store: &Store) -> Result<bool, StoreError> {
+    poll_with_fetcher(store, |seed, author| async move {
+        fetch_list(&seed, author).await
+    })
+    .await
+}
+
+async fn poll_with_fetcher<F, Fut>(store: &Store, mut fetch: F) -> Result<bool, StoreError>
+where
+    F: FnMut(String, PublicKey) -> Fut,
+    Fut: std::future::Future<Output = Option<Event>>,
+{
     // Retire removed hints after a 24-hour client migration overlap.
-    query("DELETE FROM key_relays WHERE retire_at<=unixepoch()")
+    let retired = query("DELETE FROM key_relays WHERE retire_at<=unixepoch()")
         .execute(&store.pool)
-        .await?;
-    query("DELETE FROM relays WHERE discovered=1 AND NOT EXISTS(SELECT 1 FROM key_relays WHERE relay_id=relays.id)").execute(&store.pool).await?;
+        .await?
+        .rows_affected()
+        > 0;
+    let removed = query("DELETE FROM relays WHERE discovered=1 AND NOT EXISTS(SELECT 1 FROM key_relays WHERE relay_id=relays.id)")
+        .execute(&store.pool)
+        .await?
+        .rows_affected()
+        > 0;
+    let mut changed = retired || removed;
+
     let row:Option<(i64,String)>=query_as("SELECT k.id,k.public_key FROM stored_keys k JOIN key_relay_lists d ON d.stored_key_id=k.id WHERE d.next_fetch_at<=unixepoch() ORDER BY d.next_fetch_at,k.id LIMIT 1").fetch_optional(&store.pool).await?;
     let Some((id, public)) = row else {
-        return Ok(());
+        return Ok(changed);
     };
     query("UPDATE key_relay_lists SET next_fetch_at=unixepoch()+300 WHERE stored_key_id=?")
         .bind(id)
@@ -231,15 +250,17 @@ pub async fn poll(store: &Store) -> Result<(), StoreError> {
     for seed in
         std::iter::once("wss://purplepag.es").chain(seeds.iter().take(2).map(String::as_str))
     {
-        if let Some(event) = fetch_list(seed, author).await {
-            if best.as_ref().is_none_or(|old| newer(&event, old)) {
+        if let Some(event) = fetch(seed.to_owned(), author).await {
+            if parse(&event, author, Timestamp::now().as_secs()).is_some()
+                && best.as_ref().is_none_or(|old| newer(&event, old))
+            {
                 best = Some(event);
             }
         }
     }
     let Some(event) = best else {
         query("UPDATE key_relay_lists SET status='unavailable',fetched_at=unixepoch(),next_fetch_at=unixepoch()+1800 WHERE stored_key_id=?").bind(id).execute(&store.pool).await?;
-        return Ok(());
+        return Ok(changed);
     };
     let candidates = parse(&event, author, Timestamp::now().as_secs()).unwrap_or_default();
     let mut tx = store.pool.begin().await?;
@@ -249,7 +270,7 @@ pub async fn poll(store: &Store) -> Result<(), StoreError> {
             .fetch_optional(&mut *tx)
             .await?;
     let Some((old_id, old_at)) = old else {
-        return Ok(());
+        return Ok(changed);
     };
     if old_at.is_none_or(|at| {
         event.created_at.as_secs() as i64 > at
@@ -278,7 +299,7 @@ pub async fn poll(store: &Store) -> Result<(), StoreError> {
             .fetch_one(&store.pool)
             .await?;
     if !automatic {
-        return Ok(());
+        return Ok(changed);
     }
     let urls:Vec<String>=query_scalar("SELECT url FROM key_relays WHERE stored_key_id=? AND listed=1 ORDER BY write DESC,url LIMIT 4").bind(id).fetch_all(&store.pool).await?;
     for url in urls {
@@ -298,13 +319,14 @@ pub async fn poll(store: &Store) -> Result<(), StoreError> {
             .fetch_one(&mut *tx)
             .await?;
             if active < 4 {
-                query("INSERT OR IGNORE INTO relays(url,enabled,sort_order,discovered) SELECT ?,1,100,1 WHERE (SELECT count(*) FROM relays)<20 AND EXISTS(SELECT 1 FROM key_relays WHERE stored_key_id=? AND url=? AND listed=1)").bind(&url).bind(id).bind(&url).execute(&mut *tx).await?;
-                query("UPDATE key_relays SET relay_id=(SELECT id FROM relays WHERE url=? AND enabled=1) WHERE stored_key_id=? AND url=? AND listed=1").bind(&url).bind(id).bind(&url).execute(&mut *tx).await?;
+                let inserted = query("INSERT OR IGNORE INTO relays(url,enabled,sort_order,discovered) SELECT ?,1,100,1 WHERE (SELECT count(*) FROM relays)<20 AND EXISTS(SELECT 1 FROM key_relays WHERE stored_key_id=? AND url=? AND listed=1)").bind(&url).bind(id).bind(&url).execute(&mut *tx).await?.rows_affected() > 0;
+                let linked = query("UPDATE key_relays SET relay_id=(SELECT id FROM relays WHERE url=? AND enabled=1) WHERE stored_key_id=? AND url=? AND listed=1 AND relay_id IS NULL").bind(&url).bind(id).bind(&url).execute(&mut *tx).await?.rows_affected() > 0;
+                changed |= inserted || linked;
             }
         }
         tx.commit().await?;
     }
-    Ok(())
+    Ok(changed)
 }
 
 #[cfg(test)]
@@ -332,5 +354,85 @@ mod tests {
         )
         .is_none());
         assert!(parse(&e, keys.public_key(), 0).is_none());
+    }
+
+    #[tokio::test]
+    async fn poll_caches_nip65_list_when_auto_activate_is_disabled_without_activating_routes() {
+        let pool = sqlx_sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query::query("PRAGMA foreign_keys=ON")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::raw_sql::raw_sql(concat!(
+            include_str!("../../database/migrations/0001_initial.sql"),
+            "\n",
+            include_str!("../../database/migrations/0004_key_relay_discovery.sql")
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let store = Store::new(
+            pool.clone(),
+            keycast_core::v2::envelope::EnvelopeCipher::from_key(zeroize::Zeroizing::new([3; 32])),
+        );
+        let team_id: i64 = query_scalar("INSERT INTO teams(name) VALUES('ops') RETURNING id")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let admin = Keys::generate();
+        let imported = Keys::generate();
+        let stored_key = store
+            .seal_stored_key(
+                team_id,
+                &admin.public_key().to_hex(),
+                "Imported".into(),
+                zeroize::Zeroizing::new(imported.secret_key().to_secret_hex()),
+            )
+            .await
+            .unwrap();
+        let auto_activate: bool =
+            query_scalar("SELECT auto_activate FROM relay_discovery_policy WHERE singleton=1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(!auto_activate, "auto_activate must default to false");
+
+        let nip65 = EventBuilder::new(Kind::RelayList, "")
+            .tags([
+                Tag::parse(["r", "wss://discovered.example", "write"]).unwrap(),
+                Tag::parse(["r", "wss://read-only.example", "read"]).unwrap(),
+            ])
+            .finalize(&imported)
+            .unwrap();
+        let nip65_id = nip65.id.to_hex();
+
+        let changed = poll_with_fetcher(&store, move |_seed, author| {
+            let event = (author == imported.public_key()).then(|| nip65.clone());
+            async move { event }
+        })
+        .await
+        .unwrap();
+        assert!(
+            !changed,
+            "caching NIP-65 hints with auto_activate=false must not activate routes"
+        );
+
+        let info = store.key_relay_info(stored_key.id).await.unwrap();
+        assert_eq!(info.status, "cached");
+        assert_eq!(info.event_id.as_deref(), Some(nip65_id.as_str()));
+        assert!(info.fetched_at.is_some());
+        assert!(!info.auto_activate);
+        assert_eq!(info.relays.len(), 2);
+        assert!(info.relays.iter().all(|r| !r.active && r.listed));
+
+        let discovered_rows: i64 = query_scalar("SELECT count(*) FROM relays WHERE discovered=1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(discovered_rows, 0);
     }
 }

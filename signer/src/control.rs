@@ -1,7 +1,7 @@
 use crate::runtime::RuntimeState;
 use keycast_core::v2::control::{ControlRequest, ControlResponse, HttpReply, LifecycleRequest};
 use keycast_core::v2::management::{MAX_CONTROL_BYTES, MAX_HTTP_BODY};
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,7 +19,12 @@ pub async fn serve_control_socket(
     shutdown: watch::Receiver<bool>,
 ) -> Result<(), std::io::Error> {
     if let Some(parent) = socket_path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o750)
+                .create(parent)?;
+        }
     }
     if let Ok(metadata) = std::fs::symlink_metadata(&socket_path) {
         if !metadata.file_type().is_socket() {
@@ -278,6 +283,12 @@ pub(crate) fn safe_error(error: &crate::store::StoreError) -> ControlResponse {
             ("invalid_input", "invalid request")
         }
         StoreError::InvitationNotClaimable => ("not_claimable", "invitation is not claimable"),
+        StoreError::Database(e)
+            if e.as_database_error()
+                .is_some_and(|db| db.is_unique_violation()) =>
+        {
+            ("conflict", "resource already exists")
+        }
         _ => ("internal_error", "signer operation failed"),
     };
     tracing::warn!(code, error = %error, "signer control operation rejected");

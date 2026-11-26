@@ -9,7 +9,7 @@ Group=keycast
 UMask=0077
 EnvironmentFile=/etc/keycast/host-operations.env
 ExecStart=/usr/bin/python3 /opt/keycast/scripts/operations/keycast_ops.py backup /etc/keycast/operations.json
-TimeoutStartSec=1h
+TimeoutStartSec=2h
 
 # The backup CLI reads the database and root credential and writes an encrypted
 # archive, so it needs the database directory (the snapshot is written beside the

@@ -31,7 +31,7 @@
     onclick={copy}
     aria-label={copied ? "Copied" : `${label} to clipboard`}
     title={copied ? "Copied" : label}
-    class="inline-flex items-center gap-1 p-1 shrink-0 {extraClasses}"
+    class="inline-flex items-center gap-1 p-1 rounded-md text-muted hover:text-ink hover:bg-white/5 transition-colors shrink-0 {extraClasses}"
 >
     {#if copied}<Check weight="bold" {size} class="text-accent" />{:else}<Copy
             {size}
