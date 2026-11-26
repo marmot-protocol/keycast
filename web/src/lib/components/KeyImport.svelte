@@ -12,9 +12,19 @@
     async function submit() {
         const user = getCurrentUser()?.user;
         if (!user || busy) return;
+        const trimmedName = name.trim();
+        const trimmedSecret = secretKey.trim();
+        if (
+            /^[0-9a-f]{64}$/i.test(trimmedName) ||
+            trimmedName.toLowerCase().includes("nsec1") ||
+            (trimmedSecret && trimmedName === trimmedSecret)
+        ) {
+            error = "Key name looks like private key material. Use a descriptive label instead.";
+            return;
+        }
         error = "";
         busy = true;
-        const request = { name: name.trim(), secret_key: secretKey };
+        const request = { name: trimmedName, secret_key: secretKey };
         secretKey = "";
         try {
             const endpoint = `/teams/${id}/keys`;
