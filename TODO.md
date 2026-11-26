@@ -6,7 +6,7 @@ The locally implementable audit hardening and expanded test suite are tracked in
 September 9 decision: finish the soak phase and move toward normal personal use.
 No further timed soaks are planned. The remaining reliability findings stay tracked
 as follow-ups; completed soak evidence does not close independent review or recovery work.
-Fresh-install signing defaults are nos.lol, Primal and Damus; Ditto and Bucket are excluded.
+Fresh-install signing defaults are nos.lol and Primal; Damus, Ditto and Bucket are excluded.
 
 September 9 second review pass: the high and medium findings from the signer, web, crypto and
 deployment reviews are fixed and covered by tests. See the [second-pass table](docs/development/history/V2_AUDIT.md#second-review-pass-september-9-2026).

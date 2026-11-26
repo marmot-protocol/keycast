@@ -37,27 +37,30 @@ async fn current_relay_defaults_preserve_existing_grants_and_custom_configuratio
         .execute(&pool)
         .await
         .unwrap();
+        raw_sql(include_str!(
+            "../../database/migrations/0006_remove_damus_default_relay.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
         let urls: Vec<String> = query_scalar("SELECT url FROM relays ORDER BY sort_order")
             .fetch_all(&pool)
             .await
             .unwrap();
-        assert_eq!(
-            urls,
-            [
+        let expected: Vec<&str> = match scenario {
+            "fresh" => vec!["wss://nos.lol", "wss://relay.primal.net"],
+            "custom" => vec![
                 "wss://nos.lol",
-                if scenario == "custom" {
-                    "wss://relay.example"
-                } else {
-                    "wss://relay.primal.net"
-                },
-                if scenario == "fresh" {
-                    "wss://relay.damus.io"
-                } else {
-                    "wss://bucket.coracle.social"
-                },
+                "wss://relay.example",
+                "wss://bucket.coracle.social",
             ],
-            "{scenario}"
-        );
+            _ => vec![
+                "wss://nos.lol",
+                "wss://relay.primal.net",
+                "wss://bucket.coracle.social",
+            ],
+        };
+        assert_eq!(urls, expected, "{scenario}");
     }
 }
 

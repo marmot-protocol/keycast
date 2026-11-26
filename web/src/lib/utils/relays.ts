@@ -1,7 +1,6 @@
 export const REQUIRED_PUBLIC_RELAYS = [
     "wss://nos.lol",
     "wss://relay.primal.net",
-    "wss://relay.damus.io",
 ] as const;
 
 export const DEFAULT_NOSTR_READ_RELAYS = [
