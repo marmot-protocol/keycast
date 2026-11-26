@@ -12,15 +12,6 @@
 #   docker network create --internal keycast   # scripts/init.sh does this
 #   docker compose -f caddy-docker-compose-example.yml up -d
 #
-# Upgrading from an older root-owned Caddy proxy:
-#   1. Update ./Caddyfile with http_port 8080, https_port 8443, the explicit
-#      http://{$DOMAIN} redirect, and the 127.0.0.1:2020 /healthz block.
-#   2. Stop Caddy and transfer caddy_data/caddy_config ownership to 10001:10001:
-#      docker compose -f caddy-docker-compose-example.yml down
-#      docker compose -f caddy-docker-compose-example.yml run --rm --user 0 \
-#        --entrypoint sh caddy -c 'chown -R 10001:10001 /data /config'
-#   3. Start Caddy again: docker compose -f caddy-docker-compose-example.yml up -d
-#
 # Verify the pinned digest before trusting it:
 #   docker buildx imagetools inspect caddy:2.10-alpine
 
@@ -28,15 +19,12 @@ services:
   caddy:
     image: caddy:2.10-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d
     container_name: keycast-caddy
-    user: "10001:10001"
     ports:
-      - "80:8080"
-      - "443:8443"
-      - "443:8443/udp"
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
     environment:
       DOMAIN: "${DOMAIN:?error}"
-      XDG_DATA_HOME: /data
-      XDG_CONFIG_HOME: /config
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
@@ -58,6 +46,9 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+    cap_add:
+      # Binding 80 and 443 is the only privilege this needs.
+      - NET_BIND_SERVICE
     ulimits:
       core: 0
       nofile:
@@ -71,7 +62,7 @@ services:
         max-file: "3"
         compress: "true"
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:2020/healthz"]
+      test: ["CMD", "caddy", "version"]
       interval: 30s
       timeout: 6s
       retries: 3

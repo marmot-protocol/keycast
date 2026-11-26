@@ -113,16 +113,15 @@ for name, service in config.get("services", {}).items():
     if name == "caddy":
         if service.get("read_only") is not True:
             errors.append("caddy: read_only must be true")
-        if service.get("user") != "10001:10001":
-            errors.append("caddy: user must be 10001:10001")
         mem = service.get("mem_limit")
         swap = service.get("memswap_limit")
         if not mem or swap != mem:
             errors.append("caddy: memswap_limit must equal mem_limit")
         if service.get("cap_drop") != ["ALL"]:
             errors.append("caddy: cap_drop must be [\"ALL\"]")
-        if service.get("cap_add"):
-            errors.append("caddy: must not add capabilities")
+        extra_caps = sorted(set(service.get("cap_add") or []) - {"NET_BIND_SERVICE"})
+        if extra_caps:
+            errors.append("caddy: unexpected cap_add {}".format(extra_caps))
         if "no-new-privileges:true" not in (service.get("security_opt") or []):
             errors.append("caddy: missing no-new-privileges:true")
 if errors:

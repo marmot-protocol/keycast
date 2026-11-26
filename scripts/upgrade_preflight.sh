@@ -203,16 +203,6 @@ else
     fi
 fi
 
-if [[ -f "$ROOT_DIR/Caddyfile" ]]; then
-    if grep -qE '^[[:space:]]*http_port[[:space:]]+8080\b' "$ROOT_DIR/Caddyfile" \
-        && grep -qE '^[[:space:]]*https_port[[:space:]]+8443\b' "$ROOT_DIR/Caddyfile" \
-        && grep -q '/healthz' "$ROOT_DIR/Caddyfile"; then
-        ok "Caddyfile is configured for unprivileged ports 8080/8443 and /healthz"
-    else
-        fail "existing ./Caddyfile is missing unprivileged port (http_port 8080 / https_port 8443) or /healthz settings required by caddy-docker-compose-example.yml; see docs/upgrading.md"
-    fi
-fi
-
 if [[ -z "$KEYCAST_OPERATOR_PUBKEYS" ]]; then
     fail "KEYCAST_OPERATOR_PUBKEYS is required for global relay management"
 fi

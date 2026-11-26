@@ -11,24 +11,8 @@
 	# No admin API. It would otherwise listen on localhost:2019 inside the
 	# container and can reconfigure the proxy.
 	admin off
-	# Bind unprivileged ports so Caddy runs as non-root UID 10001 with zero capabilities.
-	http_port 8080
-	https_port 8443
 	# Uncomment for the staging CA while testing certificate issuance.
 	# acme_ca https://acme-staging-v02.api.letsencrypt.org/directory
-}
-
-# Loopback-only liveness probe for container healthchecks.
-http://127.0.0.1:2020 {
-	handle /healthz {
-		respond "ok" 200
-	}
-}
-
-# Explicit HTTP -> HTTPS redirect so Caddy redirects to public port 443 rather
-# than appending internal https_port 8443. ACME HTTP-01 challenges still work.
-http://{$DOMAIN} {
-	redir https://{$DOMAIN}{uri} permanent
 }
 
 {$DOMAIN} {

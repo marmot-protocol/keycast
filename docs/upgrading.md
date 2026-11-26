@@ -73,20 +73,6 @@ sudo docker compose -f caddy-docker-compose-example.yml up -d
 sudo docker compose -f docker-compose.prod.yml ps
 ~~~
 
-**The reverse proxy now runs unprivileged (UID 10001) with zero capabilities.** If you are upgrading an existing Caddy deployment that previously ran as root on container ports `80`/`443`:
-
-1. Update your existing `./Caddyfile` to match [`Caddyfile.example`](../Caddyfile.example): add `http_port 8080` and `https_port 8443` inside the global `{ ... }` block, add the explicit `http://{$DOMAIN}` redirect (so HTTP redirects target public port `443` instead of `:8443`), and add the loopback `http://127.0.0.1:2020` `/healthz` handler used by the container healthcheck.
-2. Stop Caddy and transfer ownership of the existing `caddy_data` and `caddy_config` volumes (where CertMagic stores mode `0700`/`0600` TLS certificates and ACME state) from `root` to `10001:10001`:
-
-~~~sh
-sudo docker compose -f caddy-docker-compose-example.yml down
-sudo docker compose -f caddy-docker-compose-example.yml run --rm --user 0 \
-  --entrypoint sh caddy -c 'chown -R 10001:10001 /data /config'
-sudo docker compose -f caddy-docker-compose-example.yml up -d
-~~~
-
-`scripts/upgrade_preflight.sh` checks any existing `./Caddyfile` for the required unprivileged port and `/healthz` settings before you restart the stack.
-
 **Management writes now pin a reply identity.** The signer derives a stable reply keypair from the
 root credential and publishes its public half through `/api/config`. Your browser pins it on first
 use. After a root-credential rotation the identity changes, so the Instance page shows a warning with
