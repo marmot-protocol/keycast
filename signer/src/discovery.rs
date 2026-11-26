@@ -210,15 +210,31 @@ impl Store {
     }
 }
 
-pub async fn poll(store: &Store) -> Result<(), StoreError> {
+pub async fn poll(store: &Store) -> Result<bool, StoreError> {
     // Retire removed hints after a 24-hour client migration overlap.
-    query("DELETE FROM key_relays WHERE retire_at<=unixepoch()")
+    let retired = query("DELETE FROM key_relays WHERE retire_at<=unixepoch()")
         .execute(&store.pool)
-        .await?;
-    query("DELETE FROM relays WHERE discovered=1 AND NOT EXISTS(SELECT 1 FROM key_relays WHERE relay_id=relays.id)").execute(&store.pool).await?;
+        .await?
+        .rows_affected()
+        > 0;
+    let removed = query("DELETE FROM relays WHERE discovered=1 AND NOT EXISTS(SELECT 1 FROM key_relays WHERE relay_id=relays.id)")
+        .execute(&store.pool)
+        .await?
+        .rows_affected()
+        > 0;
+    let mut changed = retired || removed;
+
+    let automatic: bool =
+        query_scalar("SELECT auto_activate FROM relay_discovery_policy WHERE singleton=1")
+            .fetch_one(&store.pool)
+            .await?;
+    if !automatic {
+        return Ok(changed);
+    }
+
     let row:Option<(i64,String)>=query_as("SELECT k.id,k.public_key FROM stored_keys k JOIN key_relay_lists d ON d.stored_key_id=k.id WHERE d.next_fetch_at<=unixepoch() ORDER BY d.next_fetch_at,k.id LIMIT 1").fetch_optional(&store.pool).await?;
     let Some((id, public)) = row else {
-        return Ok(());
+        return Ok(changed);
     };
     query("UPDATE key_relay_lists SET next_fetch_at=unixepoch()+300 WHERE stored_key_id=?")
         .bind(id)
@@ -239,7 +255,7 @@ pub async fn poll(store: &Store) -> Result<(), StoreError> {
     }
     let Some(event) = best else {
         query("UPDATE key_relay_lists SET status='unavailable',fetched_at=unixepoch(),next_fetch_at=unixepoch()+1800 WHERE stored_key_id=?").bind(id).execute(&store.pool).await?;
-        return Ok(());
+        return Ok(changed);
     };
     let candidates = parse(&event, author, Timestamp::now().as_secs()).unwrap_or_default();
     let mut tx = store.pool.begin().await?;
@@ -249,7 +265,7 @@ pub async fn poll(store: &Store) -> Result<(), StoreError> {
             .fetch_optional(&mut *tx)
             .await?;
     let Some((old_id, old_at)) = old else {
-        return Ok(());
+        return Ok(changed);
     };
     if old_at.is_none_or(|at| {
         event.created_at.as_secs() as i64 > at
@@ -278,7 +294,7 @@ pub async fn poll(store: &Store) -> Result<(), StoreError> {
             .fetch_one(&store.pool)
             .await?;
     if !automatic {
-        return Ok(());
+        return Ok(changed);
     }
     let urls:Vec<String>=query_scalar("SELECT url FROM key_relays WHERE stored_key_id=? AND listed=1 ORDER BY write DESC,url LIMIT 4").bind(id).fetch_all(&store.pool).await?;
     for url in urls {
@@ -298,13 +314,14 @@ pub async fn poll(store: &Store) -> Result<(), StoreError> {
             .fetch_one(&mut *tx)
             .await?;
             if active < 4 {
-                query("INSERT OR IGNORE INTO relays(url,enabled,sort_order,discovered) SELECT ?,1,100,1 WHERE (SELECT count(*) FROM relays)<20 AND EXISTS(SELECT 1 FROM key_relays WHERE stored_key_id=? AND url=? AND listed=1)").bind(&url).bind(id).bind(&url).execute(&mut *tx).await?;
-                query("UPDATE key_relays SET relay_id=(SELECT id FROM relays WHERE url=? AND enabled=1) WHERE stored_key_id=? AND url=? AND listed=1").bind(&url).bind(id).bind(&url).execute(&mut *tx).await?;
+                let inserted = query("INSERT OR IGNORE INTO relays(url,enabled,sort_order,discovered) SELECT ?,1,100,1 WHERE (SELECT count(*) FROM relays)<20 AND EXISTS(SELECT 1 FROM key_relays WHERE stored_key_id=? AND url=? AND listed=1)").bind(&url).bind(id).bind(&url).execute(&mut *tx).await?.rows_affected() > 0;
+                let linked = query("UPDATE key_relays SET relay_id=(SELECT id FROM relays WHERE url=? AND enabled=1) WHERE stored_key_id=? AND url=? AND listed=1 AND relay_id IS NULL").bind(&url).bind(id).bind(&url).execute(&mut *tx).await?.rows_affected() > 0;
+                changed |= inserted || linked;
             }
         }
         tx.commit().await?;
     }
-    Ok(())
+    Ok(changed)
 }
 
 #[cfg(test)]

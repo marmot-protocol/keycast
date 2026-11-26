@@ -583,6 +583,45 @@ impl Store {
         }))
     }
 
+    pub async fn has_active_session_for_pair(
+        &self,
+        remote_pubkey: &str,
+        client_pubkey: &str,
+    ) -> Result<bool, StoreError> {
+        Ok(query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM sessions s
+                JOIN grants g ON g.id = s.grant_id
+                WHERE g.remote_signer_public_key = ?
+                  AND s.client_public_key = ?
+                  AND s.ended_at IS NULL
+                  AND g.revoked_at IS NULL
+                  AND (g.expires_at IS NULL OR g.expires_at > unixepoch())
+             )",
+        )
+        .bind(remote_pubkey)
+        .bind(client_pubkey)
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
+    pub async fn fail_pending_input(&self, event_id: &str, reason: &str) -> Result<(), StoreError> {
+        query(
+            "UPDATE processed_requests
+             SET status = 'failed',
+                 reason_code = ?,
+                 request_event_json = NULL,
+                 reserved_response_bytes = 0,
+                 completed_at = max(unixepoch(), received_at)
+             WHERE event_id = ? AND status = 'processing' AND response_event_json IS NULL",
+        )
+        .bind(reason)
+        .bind(event_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Cheap pre-admission check prevents unknown clients filling the durable inbox.
     pub async fn can_connect(
         &self,
@@ -869,7 +908,7 @@ impl Store {
         let mut tx = self.pool.begin().await?;
         query(
             "UPDATE processed_requests SET session_id = ?, status = ?, reason_code = ?,
-                    request_event_json = NULL, response_event_json = ?, reserved_response_bytes=0,
+                    response_event_json = ?, reserved_response_bytes=0,
                     completed_at = max(unixepoch(), received_at)
              WHERE event_id = ?",
         )

@@ -102,18 +102,28 @@ impl PolicyDocument {
             if sign.allowed_kinds.len() > MAX_ALLOWED_KINDS {
                 return Err(PolicyError::TooManyKinds);
             }
-            if sign.allowed_kinds.iter().any(|&kind| {
-                kind == super::management::MANAGEMENT_KIND
-                    || kind == super::management::MANAGEMENT_READ_KIND
-            }) {
-                return Err(PolicyError::ReservedManagementKind);
-            }
             let unique: BTreeSet<u16> = sign.allowed_kinds.iter().copied().collect();
             if unique.len() != sign.allowed_kinds.len() {
                 return Err(PolicyError::DuplicateKind);
             }
         }
 
+        Ok(())
+    }
+
+    /// Strict validation for management writes (creating or updating policies).
+    /// Existing stored rows continue to hard-deny reserved management kinds in
+    /// [`Self::allows_sign_event`], while new writes reject them up front.
+    pub fn validate_for_write(&self) -> Result<(), PolicyError> {
+        self.validate()?;
+        if let Some(sign) = &self.capabilities.sign_event {
+            if sign.allowed_kinds.iter().any(|&kind| {
+                kind == super::management::MANAGEMENT_KIND
+                    || kind == super::management::MANAGEMENT_READ_KIND
+            }) {
+                return Err(PolicyError::ReservedManagementKind);
+            }
+        }
         Ok(())
     }
 
@@ -286,7 +296,7 @@ mod tests {
                     ..Capabilities::default()
                 },
             }
-            .validate(),
+            .validate_for_write(),
             Err(PolicyError::ReservedManagementKind)
         );
         assert_eq!(

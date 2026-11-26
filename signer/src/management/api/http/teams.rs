@@ -554,7 +554,7 @@ pub async fn add_policy(
     validate_name(&request.name)?;
     request
         .document
-        .validate()
+        .validate_for_write()
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
     let document = serde_json::to_string(&request.document)
         .map_err(|_| ApiError::bad_request("invalid policy"))?;
@@ -585,7 +585,7 @@ pub async fn update_policy(
     validate_name(&request.name)?;
     request
         .document
-        .validate()
+        .validate_for_write()
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
     let document = serde_json::to_string(&request.document)
         .map_err(|_| ApiError::bad_request("invalid policy"))?;
