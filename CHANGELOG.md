@@ -2,6 +2,54 @@
 
 All components use one [SemVer](docs/development/releases.md) version.
 
+## 2.1.1 — 2026-11-27
+
+Patch release fixing NIP-46 signing timeouts caused by stalled relay subscriptions and tight
+response-publication timeouts.
+
+### Highlights
+
+- Fixed a signer relay subscription stall on `nostr-sdk 0.45.6` where a relay closing a subscription
+  with `rate-limited:` left a stale subscription ID registered locally and caused every subsequent
+  retry to fail silently without sending a new `REQ`. The signer now clears stale registration
+  before resubscribing, verifies live SDK subscription registration on `EOSE` and every refresh
+  tick, enforces backoff after post-`EOSE` `CLOSED` messages, and avoids clearing or burning
+  backoff on disconnected relays (#75).
+- Raised the per-relay NIP-46 response acknowledgement timeout from 2 seconds to 5 seconds (6
+  seconds overall) while preserving the non-blocking first-acknowledgement fast path, preventing
+  timeouts on larger encrypted signing replies over slower public relays (#75).
+- Added one bounded background retry (after 500 ms, up to 32 concurrent replication batches) for
+  secondary relays that transiently fail before or after the first acknowledgement, rechecking
+  relay connectivity, live session eligibility (blocking post-logout session replies while
+  preserving logout-response delivery), active grant state, and allowed relay routing before
+  resending (#75).
+
+### Installation and upgrades
+
+Official artifacts are **Linux AMD64 containers** for Docker Compose. Use all three digests from
+this release's `release.json`/`images.env`. Exact image tags are `v2.1.1`; as a stable release,
+`v2` and `latest` advance to `v2.1.1`.
+
+Upgrading in place from `2.1.0` (or `2.0.0-rc.1` / recent v2 `master` builds) introduces no new
+database migrations, policy format changes, or default relay changes: back up before upgrading,
+retain your previous three-image manifest, and run `sudo scripts/upgrade_preflight.sh`. Instances
+that previously upgraded with a customized relay list still containing `wss://relay.damus.io`
+should disable it in **Settings → Relays** and remove it from existing `bunker://` URIs.
+
+Original Keycast/V1 databases, encrypted keys, authorization rows, credentials, and bunker URLs
+remain incompatible. An image-only rollback to `2.1.0` is compatible with the `2.1.1` database
+schema and configuration; [backup restoration](https://github.com/marmot-protocol/keycast/blob/v2.1.1/docs/backup-and-recovery.md#recovery-after-loss-or-rollback)
+revokes old grants, invitations, and sessions and requires review and re-pairing. Never regenerate
+an existing root credential to resolve an upgrade problem.
+
+### Known limitations
+
+Keycast targets a small, single-host instance and has not received an independent third-party
+security audit. Remaining operational and compatibility items are tracked in
+[TODO.md](https://github.com/marmot-protocol/keycast/blob/v2.1.1/TODO.md) and
+[AUDIT.md](https://github.com/marmot-protocol/keycast/blob/v2.1.1/AUDIT.md). A release and its
+automated checks do not establish the health of a deployed instance.
+
 ## 2.1.0 — 2026-11-26
 
 Stable release of the Keycast v2 remote signer with a redesigned operator workspace, end-to-end
