@@ -707,6 +707,252 @@ async fn first_healthy_ack_does_not_wait_for_slow_relay() {
     slow.shutdown();
 }
 
+#[derive(Debug)]
+struct SlowAckMs(u64);
+impl WritePolicy for SlowAckMs {
+    fn admit_event<'a>(
+        &'a self,
+        _: &'a Event,
+        _: &'a std::net::SocketAddr,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = WritePolicyResult> + Send + 'a>> {
+        let delay = self.0;
+        Box::pin(async move {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+            WritePolicyResult::Accept
+        })
+    }
+}
+
+#[derive(Debug)]
+struct RejectWrites {
+    reject_count: usize,
+    delay_ms: u64,
+    attempts: Arc<std::sync::atomic::AtomicUsize>,
+}
+impl WritePolicy for RejectWrites {
+    fn admit_event<'a>(
+        &'a self,
+        _: &'a Event,
+        _: &'a std::net::SocketAddr,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = WritePolicyResult> + Send + 'a>> {
+        let reject_count = self.reject_count;
+        let delay_ms = self.delay_ms;
+        let attempts = self.attempts.clone();
+        Box::pin(async move {
+            if delay_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+            if attempts.fetch_add(1, Ordering::SeqCst) < reject_count {
+                WritePolicyResult::reject(MachineReadablePrefix::RateLimited, "try again")
+            } else {
+                WritePolicyResult::Accept
+            }
+        })
+    }
+}
+
+#[tokio::test]
+async fn publish_response_accepts_slow_relay_ack_past_two_seconds() {
+    let slow = LocalRelay::builder().write_policy(SlowAckMs(2300)).build();
+    slow.run().await.unwrap();
+    let f = Fixture::new(slow.url().await.as_str()).await;
+    let c = Client::new();
+    c.add_relay(slow.url().await).await.unwrap();
+    c.connect().and_wait(Duration::from_secs(2)).await;
+
+    let processor = f.processor();
+    processor
+        .process_and_publish(&c, &f.connect())
+        .await
+        .expect("slow relay ACK past 2s must succeed within the publish timeout");
+
+    let acknowledged: i64 =
+        query_scalar("SELECT count(*) FROM relay_checkpoints WHERE last_published_at IS NOT NULL")
+            .fetch_one(&f.store.pool)
+            .await
+            .unwrap();
+    assert_eq!(acknowledged, 1);
+
+    c.shutdown().await;
+    slow.shutdown();
+}
+
+#[tokio::test]
+async fn replication_retries_transient_secondary_relay_failure_without_blocking_first_ack() {
+    let good = LocalRelay::builder().write_policy(SlowAckMs(100)).build();
+    good.run().await.unwrap();
+    let before_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let flaky_before = LocalRelay::builder()
+        .write_policy(RejectWrites {
+            reject_count: 1,
+            delay_ms: 0,
+            attempts: before_attempts.clone(),
+        })
+        .build();
+    flaky_before.run().await.unwrap();
+    let after_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let flaky_after = LocalRelay::builder()
+        .write_policy(RejectWrites {
+            reject_count: 1,
+            delay_ms: 200,
+            attempts: after_attempts.clone(),
+        })
+        .build();
+    flaky_after.run().await.unwrap();
+
+    let f = Fixture::new(good.url().await.as_str()).await;
+    let c = Client::new();
+    c.add_relay(good.url().await).await.unwrap();
+    c.add_relay(flaky_before.url().await).await.unwrap();
+    c.add_relay(flaky_after.url().await).await.unwrap();
+    c.connect().and_wait(Duration::from_secs(2)).await;
+    for url in [flaky_before.url().await, flaky_after.url().await] {
+        query("INSERT INTO relays(url) VALUES(?)")
+            .bind(url.as_str())
+            .execute(&f.store.pool)
+            .await
+            .unwrap();
+    }
+
+    let observer_before = Client::new();
+    observer_before
+        .add_relay(flaky_before.url().await)
+        .await
+        .unwrap();
+    let mut stream_before = observer_before.notifications();
+    observer_before
+        .connect()
+        .and_wait(Duration::from_secs(2))
+        .await;
+    observer_before
+        .subscribe(
+            Filter::new()
+                .kind(Kind::NostrConnect)
+                .pubkey(f.client.public_key()),
+        )
+        .await
+        .unwrap();
+
+    let observer_after = Client::new();
+    observer_after
+        .add_relay(flaky_after.url().await)
+        .await
+        .unwrap();
+    let mut stream_after = observer_after.notifications();
+    observer_after
+        .connect()
+        .and_wait(Duration::from_secs(2))
+        .await;
+    observer_after
+        .subscribe(
+            Filter::new()
+                .kind(Kind::NostrConnect)
+                .pubkey(f.client.public_key()),
+        )
+        .await
+        .unwrap();
+
+    let processor = f.processor();
+    let start = std::time::Instant::now();
+    processor
+        .process_and_publish(&c, &f.connect())
+        .await
+        .unwrap();
+    assert!(
+        start.elapsed() < Duration::from_millis(750),
+        "first healthy ACK must not block on secondary relay retry"
+    );
+    assert_eq!(before_attempts.load(Ordering::SeqCst), 1);
+
+    assert_eq!(
+        reply(&mut stream_before, "connect", &f).await["result"],
+        "ack"
+    );
+    assert_eq!(
+        reply(&mut stream_after, "connect", &f).await["result"],
+        "ack"
+    );
+    processor.shutdown_replication().await;
+    assert_eq!(before_attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(after_attempts.load(Ordering::SeqCst), 2);
+    let acknowledged: i64 =
+        query_scalar("SELECT count(*) FROM relay_checkpoints WHERE last_published_at IS NOT NULL")
+            .fetch_one(&f.store.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        acknowledged, 3,
+        "secondary relay checkpoints must record both pre-ACK and post-ACK retries"
+    );
+
+    observer_before.shutdown().await;
+    observer_after.shutdown().await;
+    c.shutdown().await;
+    good.shutdown();
+    flaky_before.shutdown();
+    flaky_after.shutdown();
+}
+
+#[tokio::test]
+async fn replication_retry_aborts_after_session_logout() {
+    let good = LocalRelay::builder().write_policy(SlowAckMs(100)).build();
+    good.run().await.unwrap();
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let flaky = LocalRelay::builder()
+        .write_policy(RejectWrites {
+            reject_count: 2,
+            delay_ms: 0,
+            attempts: attempts.clone(),
+        })
+        .build();
+    flaky.run().await.unwrap();
+
+    let f = Fixture::new(good.url().await.as_str()).await;
+    let c = Client::new();
+    c.add_relay(good.url().await).await.unwrap();
+    c.add_relay(flaky.url().await).await.unwrap();
+    c.connect().and_wait(Duration::from_secs(2)).await;
+
+    let processor = f.processor();
+    processor.prepare_response(&f.connect()).await.unwrap();
+
+    query("INSERT INTO relays(url) VALUES(?)")
+        .bind(flaky.url().await.as_str())
+        .execute(&f.store.pool)
+        .await
+        .unwrap();
+
+    let ping = f.event("ping-before-logout", "ping", vec![]);
+    processor.process_and_publish(&c, &ping).await.unwrap();
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+    let logout = f.event("logout-during-retry", "logout", vec![]);
+    processor.prepare_response(&logout).await.unwrap();
+
+    processor.shutdown_replication().await;
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        1,
+        "delayed replication retry must not republish a session response after logout"
+    );
+
+    // The logout response itself stays eligible for secondary-relay retry.
+    processor
+        .publish_cached_response(&c, &logout.id.to_hex())
+        .await
+        .unwrap();
+    processor.shutdown_replication().await;
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        3,
+        "logout response must still retry on a transiently failing secondary relay"
+    );
+
+    c.shutdown().await;
+    good.shutdown();
+    flaky.shutdown();
+}
+
 #[tokio::test]
 async fn host_cli_backup_rotation_restore_and_overwrite_refusal() {
     use std::{path::Path, process::Command};
