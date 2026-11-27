@@ -293,6 +293,9 @@ pub async fn relay_supervisor(
                             }
                             RelayMessage::Closed { subscription_id, message } if subscription_id.as_ref() == &subscription => {
                                 accepted.remove(&relay_url.to_string());
+                                subscription_retries
+                                    .entry(relay_url.to_string())
+                                    .or_default();
                                 let reason = crate::relay_diagnostics::rejection_reason(message.as_ref());
                                 telemetry.record(relay_url.as_str(), if message.starts_with("auth-required:") { "error_subscription_auth" } else if message.starts_with("rate-limited:") { "error_subscription_rate" } else { "error_subscription_other" });
                                 if let Some(diagnostics) = state.relay_diagnostics.write().await.get_mut(relay_url.as_str().trim_end_matches('/')) {
@@ -609,12 +612,19 @@ pub async fn relay_supervisor(
                     if !subscribed_keys.is_empty() {
                         for (url,relay) in client.relays().await {
                             if !accepted.contains(url.as_str()) {
+                                let attempts = subscription_retries
+                                    .get(url.as_str())
+                                    .map_or(0, |retry| retry.attempts);
+                                if !can_attempt_subscription(relay.status(), attempts) {
+                                    continue;
+                                }
                                 let retry = subscription_retries.entry(url.to_string()).or_insert_with(|| SubscriptionRetry { next: std::time::Instant::now(), attempts:0 });
                                 if !retry.due(std::time::Instant::now()) { continue; }
-                                retry.attempted(std::time::Instant::now());
                                 let Some(keys)=relay_keys.get(url.as_str().trim_end_matches('/')) else {continue;};
-                                let filter=Filter::new().pubkeys(keys.iter().copied()).kind(Kind::NostrConnect).since(Timestamp::from_secs(Timestamp::now().as_secs().saturating_sub(300)));
-                                let _=relay.subscribe(filter).with_id(subscription.clone()).await;
+                                retry.attempted(std::time::Instant::now());
+                                if subscribe_relay(&relay, &subscription, keys).await.is_err() {
+                                    tracing::debug!(relay = %url, "signing subscription attempt failed");
+                                }
                             }
                         }
                     }
@@ -819,9 +829,163 @@ fn progress_tick() -> u64 {
         .as_secs()
 }
 
+fn can_attempt_subscription(status: nostr_sdk::prelude::RelayStatus, attempts: u32) -> bool {
+    use nostr_sdk::prelude::RelayStatus;
+    status.is_connected()
+        || (attempts == 0
+            && matches!(
+                status,
+                RelayStatus::Initialized | RelayStatus::Pending | RelayStatus::Connecting
+            ))
+}
+
+async fn subscribe_relay(
+    relay: &nostr_sdk::prelude::Relay,
+    subscription: &nostr::prelude::SubscriptionId,
+    keys: &std::collections::BTreeSet<PublicKey>,
+) -> Result<(), nostr_sdk::error::Error> {
+    // nostr-sdk 0.45+ keeps a subscription ID registered after a `CLOSED`
+    // `rate-limited:` or unacknowledged REQ and rejects reusing that ID with
+    // `subscription ID already exists`. Clear any stale local registration
+    // before sending a fresh REQ.
+    let _ = relay.unsubscribe(subscription).await;
+    let filter = Filter::new()
+        .pubkeys(keys.iter().copied())
+        .kind(Kind::NostrConnect)
+        .since(Timestamp::from_secs(
+            Timestamp::now().as_secs().saturating_sub(300),
+        ));
+    relay
+        .subscribe(filter)
+        .with_id(subscription.clone())
+        .await
+        .map(|_| ())
+}
+
 #[cfg(test)]
 mod retry_tests {
     use super::*;
+    use nostr::prelude::{
+        EventBuilder, FinalizeEvent, Keys, MachineReadablePrefix, SubscriptionId,
+    };
+    use nostr_sdk::prelude::{
+        LocalRelay, QueryPolicy, QueryPolicyResult, RelayMessage, RelayNotification,
+    };
+    use std::collections::BTreeSet;
+    use std::sync::atomic::AtomicUsize;
+
+    #[derive(Debug)]
+    struct RateLimitOnce(Arc<AtomicUsize>);
+
+    impl QueryPolicy for RateLimitOnce {
+        fn admit_query<'a>(
+            &'a self,
+            _: &'a mut Filter,
+            _: &'a std::net::SocketAddr,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = QueryPolicyResult> + Send + 'a>>
+        {
+            Box::pin(async move {
+                if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                    QueryPolicyResult::reject(MachineReadablePrefix::RateLimited, "slow down")
+                } else {
+                    QueryPolicyResult::Accept
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn subscribe_relay_recovers_after_rate_limited_closed_on_same_subscription_id() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let local = LocalRelay::builder()
+            .query_policy(RateLimitOnce(attempts.clone()))
+            .build();
+        local.run().await.unwrap();
+
+        let client = Client::new();
+        client.add_relay(local.url().await).await.unwrap();
+        client.connect().and_wait(Duration::from_secs(2)).await;
+        let relay = client.relay(local.url().await).await.unwrap().unwrap();
+        let mut notifications = relay.notifications();
+
+        let target = Keys::generate();
+        let sender = Keys::generate();
+        let keys = BTreeSet::from([target.public_key()]);
+        let sub_id = SubscriptionId::generate();
+
+        subscribe_relay(&relay, &sub_id, &keys)
+            .await
+            .expect("initial subscribe should send REQ");
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(notification) = notifications.next().await {
+                if let RelayNotification::Message { message } = notification {
+                    if let RelayMessage::Closed {
+                        subscription_id,
+                        message,
+                    } = *message
+                    {
+                        if subscription_id.as_ref() == &sub_id {
+                            assert!(message.starts_with("rate-limited:"));
+                            return;
+                        }
+                    }
+                }
+            }
+            panic!("relay closed notification stream before rate-limited CLOSED");
+        })
+        .await
+        .expect("initial REQ should be rejected with rate-limited CLOSED");
+
+        subscribe_relay(&relay, &sub_id, &keys)
+            .await
+            .expect("retry on same subscription ID must clear stale closed state and send REQ");
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(notification) = notifications.next().await {
+                if let RelayNotification::Message { message } = notification {
+                    if let RelayMessage::EndOfStoredEvents(id) = *message {
+                        if id.as_ref() == &sub_id {
+                            return;
+                        }
+                    }
+                }
+            }
+            panic!("relay closed notification stream before EOSE");
+        })
+        .await
+        .expect("retried subscription must receive EOSE");
+
+        let event = EventBuilder::new(Kind::NostrConnect, "probe")
+            .tag(nostr::prelude::Tag::public_key(target.public_key()))
+            .finalize(&sender)
+            .unwrap();
+        relay.send_event(&event).await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(notification) = notifications.next().await {
+                if let RelayNotification::Message { message } = notification {
+                    if let RelayMessage::Event {
+                        subscription_id,
+                        event: received,
+                    } = *message
+                    {
+                        if subscription_id.as_ref() == &sub_id && received.id == event.id {
+                            return;
+                        }
+                    }
+                }
+            }
+            panic!("relay closed notification stream before delivering event");
+        })
+        .await
+        .expect("recovered subscription must deliver live NIP-46 events");
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        client.shutdown().await;
+        local.shutdown();
+    }
+
     #[test]
     fn failed_delivery_signal_expires_on_an_idle_instance() {
         let now = std::time::Instant::now();
@@ -849,5 +1013,41 @@ mod retry_tests {
             assert!(retry.due(now));
         }
         assert_eq!(SubscriptionRetry::default().attempts, 0);
+    }
+
+    #[test]
+    fn can_attempt_subscription_gates_disconnected_and_retried_connecting_relays() {
+        use nostr_sdk::prelude::RelayStatus;
+
+        assert!(can_attempt_subscription(RelayStatus::Connected, 0));
+        assert!(can_attempt_subscription(RelayStatus::Connected, 3));
+
+        for initial in [
+            RelayStatus::Initialized,
+            RelayStatus::Pending,
+            RelayStatus::Connecting,
+        ] {
+            assert!(
+                can_attempt_subscription(initial, 0),
+                "{initial:?} should allow initial registration"
+            );
+            assert!(
+                !can_attempt_subscription(initial, 1),
+                "{initial:?} should not retry or clear registration before reconnect"
+            );
+        }
+
+        for offline in [
+            RelayStatus::Disconnected,
+            RelayStatus::Terminated,
+            RelayStatus::Banned,
+            RelayStatus::Shutdown,
+        ] {
+            assert!(
+                !can_attempt_subscription(offline, 0),
+                "{offline:?} must never unsubscribe or burn retry backoff"
+            );
+            assert!(!can_attempt_subscription(offline, 2));
+        }
     }
 }

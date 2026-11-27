@@ -20,6 +20,11 @@ const MAX_METHOD_BYTES: usize = 64;
 const MAX_PARAMS: usize = 4;
 const MAX_REQUEST_AGE_SECONDS: u64 = 300;
 const MAX_FUTURE_SKEW_SECONDS: u64 = 60;
+const PUBLISH_OK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const PUBLISH_RELAY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6);
+const REPLICATION_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+const REPLICATION_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(7);
+const MAX_REPLICATION_TASKS: usize = 32;
 
 #[derive(Default)]
 pub struct RuntimeMetrics {
@@ -681,7 +686,7 @@ impl RequestProcessor {
     pub async fn shutdown_replication(&self) {
         let mut tasks =
             std::mem::take(&mut *self.replications.lock().unwrap_or_else(|e| e.into_inner()));
-        if tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        if tokio::time::timeout(REPLICATION_SHUTDOWN_TIMEOUT, async {
             while tasks.join_next().await.is_some() {}
         })
         .await
@@ -752,6 +757,7 @@ impl RequestProcessor {
             return Err(ProtocolError::UnknownGrant);
         };
         let allowed = self.store.transport_relays(grant.stored_key_id).await?;
+        let response = Arc::new(response.clone());
         let mut sends = tokio::task::JoinSet::new();
         for (url, relay) in client.relays().await {
             if !allowed
@@ -762,45 +768,116 @@ impl RequestProcessor {
             }
             let response = response.clone();
             sends.spawn(async move {
-                let result = tokio::time::timeout(std::time::Duration::from_secs(3), async {
-                    relay
-                        .send_event(&response)
-                        .ok_timeout(std::time::Duration::from_secs(2))
-                        .await
-                })
-                .await;
-                (
-                    url,
-                    matches!(result, Ok(Ok(ref output)) if output.status().is_ack()),
-                )
+                let acked = send_event_once(&relay, &response).await;
+                (url, relay, acked)
             });
         }
+        let mut failed_relays = Vec::new();
         while let Some(result) = sends.join_next().await {
-            if let Ok((url, true)) = result {
-                // Keep redundant delivery off the first-ACK path, bounded and owned by this
-                // processor. Dropping the last processor aborts outstanding replication tasks.
-                {
-                    let mut replications =
-                        self.replications.lock().unwrap_or_else(|e| e.into_inner());
-                    while replications.try_join_next().is_some() {}
-                    if replications.len() < 16 && !sends.is_empty() {
-                        let store = self.store.clone();
-                        replications.spawn(async move {
-                            while let Some(result) = sends.join_next().await {
-                                if let Ok((url, true)) = result {
-                                    let _ = store.mark_relay_published(url.as_str()).await;
+            match result {
+                Ok((url, _, true)) => {
+                    // Keep redundant delivery off the first-ACK path, bounded and owned by this
+                    // processor. Dropping the last processor aborts outstanding replication tasks.
+                    {
+                        let mut replications =
+                            self.replications.lock().unwrap_or_else(|e| e.into_inner());
+                        while replications.try_join_next().is_some() {}
+                        if replications.len() < MAX_REPLICATION_TASKS
+                            && (!sends.is_empty() || !failed_relays.is_empty())
+                        {
+                            let store = self.store.clone();
+                            let response = response.clone();
+                            replications.spawn(async move {
+                                let mut retries = tokio::task::JoinSet::new();
+                                for (url, relay) in failed_relays {
+                                    spawn_replication_retry(
+                                        &mut retries,
+                                        store.clone(),
+                                        response.clone(),
+                                        url,
+                                        relay,
+                                    );
                                 }
-                            }
-                        });
+                                while let Some(result) = sends.join_next().await {
+                                    match result {
+                                        Ok((url, _, true)) => {
+                                            let _ = store.mark_relay_published(url.as_str()).await;
+                                        }
+                                        Ok((url, relay, false)) => {
+                                            spawn_replication_retry(
+                                                &mut retries,
+                                                store.clone(),
+                                                response.clone(),
+                                                url,
+                                                relay,
+                                            );
+                                        }
+                                        Err(_) => {}
+                                    }
+                                }
+                                while let Some(result) = retries.join_next().await {
+                                    if let Ok((url, true)) = result {
+                                        let _ = store.mark_relay_published(url.as_str()).await;
+                                    }
+                                }
+                            });
+                        }
                     }
+                    self.store.mark_relay_published(url.as_str()).await?;
+                    return Ok(());
                 }
-                self.store.mark_relay_published(url.as_str()).await?;
-                return Ok(());
+                Ok((url, relay, false)) => {
+                    failed_relays.push((url, relay));
+                }
+                Err(_) => {}
             }
         }
         self.metrics.relay_failures.fetch_add(1, Ordering::Relaxed);
         Err(ProtocolError::Response)
     }
+}
+
+async fn send_event_once(relay: &nostr_sdk::prelude::Relay, response: &Event) -> bool {
+    let result = tokio::time::timeout(PUBLISH_RELAY_TIMEOUT, async {
+        relay
+            .send_event(response)
+            .ok_timeout(PUBLISH_OK_TIMEOUT)
+            .await
+    })
+    .await;
+    matches!(result, Ok(Ok(ref output)) if output.status().is_ack())
+}
+
+fn spawn_replication_retry(
+    retries: &mut tokio::task::JoinSet<(nostr::prelude::RelayUrl, bool)>,
+    store: Store,
+    response: Arc<Event>,
+    url: nostr::prelude::RelayUrl,
+    relay: nostr_sdk::prelude::Relay,
+) {
+    if !relay.status().is_connected() {
+        return;
+    }
+    retries.spawn(async move {
+        tokio::time::sleep(REPLICATION_RETRY_DELAY).await;
+        if !relay.status().is_connected() {
+            return (url, false);
+        }
+        let Ok(Some(grant)) = store.grant_for_recipient(&response.pubkey.to_hex()).await else {
+            return (url, false);
+        };
+        let Ok(allowed) = store.transport_relays(grant.stored_key_id).await else {
+            return (url, false);
+        };
+        if !allowed
+            .iter()
+            .any(|u| u.trim_end_matches('/') == url.as_str().trim_end_matches('/'))
+        {
+            return (url, false);
+        }
+        let acked = send_event_once(&relay, &response).await;
+        (url, acked)
+    });
 }
 
 pub(crate) fn validate_outer_bounds(event: &Event) -> Result<(), ProtocolError> {

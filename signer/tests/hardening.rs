@@ -707,6 +707,130 @@ async fn first_healthy_ack_does_not_wait_for_slow_relay() {
     slow.shutdown();
 }
 
+#[derive(Debug)]
+struct SlowAckMs(u64);
+impl WritePolicy for SlowAckMs {
+    fn admit_event<'a>(
+        &'a self,
+        _: &'a Event,
+        _: &'a std::net::SocketAddr,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = WritePolicyResult> + Send + 'a>> {
+        let delay = self.0;
+        Box::pin(async move {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+            WritePolicyResult::Accept
+        })
+    }
+}
+
+#[derive(Debug)]
+struct RejectWriteOnce(Arc<std::sync::atomic::AtomicUsize>);
+impl WritePolicy for RejectWriteOnce {
+    fn admit_event<'a>(
+        &'a self,
+        _: &'a Event,
+        _: &'a std::net::SocketAddr,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = WritePolicyResult> + Send + 'a>> {
+        Box::pin(async move {
+            if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                WritePolicyResult::reject(MachineReadablePrefix::RateLimited, "try again")
+            } else {
+                WritePolicyResult::Accept
+            }
+        })
+    }
+}
+
+#[tokio::test]
+async fn publish_response_accepts_slow_relay_ack_past_two_seconds() {
+    let slow = LocalRelay::builder().write_policy(SlowAckMs(2300)).build();
+    slow.run().await.unwrap();
+    let f = Fixture::new(slow.url().await.as_str()).await;
+    let c = Client::new();
+    c.add_relay(slow.url().await).await.unwrap();
+    c.connect().and_wait(Duration::from_secs(2)).await;
+
+    let processor = f.processor();
+    processor
+        .process_and_publish(&c, &f.connect())
+        .await
+        .expect("slow relay ACK past 2s must succeed within the publish timeout");
+
+    let acknowledged: i64 =
+        query_scalar("SELECT count(*) FROM relay_checkpoints WHERE last_published_at IS NOT NULL")
+            .fetch_one(&f.store.pool)
+            .await
+            .unwrap();
+    assert_eq!(acknowledged, 1);
+
+    c.shutdown().await;
+    slow.shutdown();
+}
+
+#[tokio::test]
+async fn replication_retries_transient_secondary_relay_failure_without_blocking_first_ack() {
+    let good = LocalRelay::new();
+    good.run().await.unwrap();
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let flaky = LocalRelay::builder()
+        .write_policy(RejectWriteOnce(attempts.clone()))
+        .build();
+    flaky.run().await.unwrap();
+
+    let f = Fixture::new(good.url().await.as_str()).await;
+    let c = Client::new();
+    c.add_relay(good.url().await).await.unwrap();
+    c.add_relay(flaky.url().await).await.unwrap();
+    c.connect().and_wait(Duration::from_secs(2)).await;
+    query("INSERT INTO relays(url) VALUES(?)")
+        .bind(flaky.url().await.as_str())
+        .execute(&f.store.pool)
+        .await
+        .unwrap();
+
+    let observer = Client::new();
+    observer.add_relay(flaky.url().await).await.unwrap();
+    let mut stream = observer.notifications();
+    observer.connect().and_wait(Duration::from_secs(2)).await;
+    observer
+        .subscribe(
+            Filter::new()
+                .kind(Kind::NostrConnect)
+                .pubkey(f.client.public_key()),
+        )
+        .await
+        .unwrap();
+
+    let processor = f.processor();
+    let start = std::time::Instant::now();
+    processor
+        .process_and_publish(&c, &f.connect())
+        .await
+        .unwrap();
+    assert!(
+        start.elapsed() < Duration::from_millis(750),
+        "first healthy ACK must not block on secondary relay retry"
+    );
+
+    assert_eq!(reply(&mut stream, "connect", &f).await["result"], "ack");
+    processor.shutdown_replication().await;
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    let acknowledged: i64 =
+        query_scalar("SELECT count(*) FROM relay_checkpoints WHERE last_published_at IS NOT NULL")
+            .fetch_one(&f.store.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        acknowledged, 2,
+        "secondary relay checkpoint must record successful retry"
+    );
+
+    observer.shutdown().await;
+    c.shutdown().await;
+    good.shutdown();
+    flaky.shutdown();
+}
+
 #[tokio::test]
 async fn host_cli_backup_rotation_restore_and_overwrite_refusal() {
     use std::{path::Path, process::Command};
