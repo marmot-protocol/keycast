@@ -106,7 +106,7 @@ The instance deliberately bounds concurrency and durable storage:
 | Established-session work | 32 requests globally, two per client, eight per grant. |
 | Established-session ingress rate | 128 events/second globally, 16 per client, 32 per grant. |
 | Newcomer work (including `connect`) | Separate budget: eight active requests globally, two per client, four per grant; 32 events/second globally, four per client, eight per grant. |
-| Publication | 16 outbox publishers and up to 16 bounded background replication batches. |
+| Publication | 16 outbox publishers and up to 32 bounded background replication batches (each failed connected secondary relay gets one retry after 500 ms). |
 | Private control socket | Eight deadlined connections. |
 | Durable inbox/outbox | 10,000 rows and 128 MiB, counting encrypted payloads and reserved reply space. |
 | Per-grant backlog | 2,000 rows / 4 MiB. |
