@@ -283,6 +283,15 @@ pub async fn relay_supervisor(
                     if let ClientNotification::Message { relay_url, message } = notification {
                         match *message {
                             RelayMessage::EndOfStoredEvents(id) if id.as_ref() == &subscription => {
+                                let registered = match client.relay(&relay_url).await {
+                                    Ok(Some(relay)) => {
+                                        relay.subscription(&subscription).await.is_some()
+                                    }
+                                    _ => false,
+                                };
+                                if !registered {
+                                    return Ok(true);
+                                }
                                 if let Some(diagnostics) = state.relay_diagnostics.write().await.get_mut(relay_url.as_str().trim_end_matches('/')) {
                                     diagnostics.subscription("accepted", None, Timestamp::now().as_secs() as i64);
                                 }
@@ -586,7 +595,7 @@ pub async fn relay_supervisor(
                     }
                     client.connect().await;
                     let relays = client.relays().await;
-                    accepted.retain(|url| relays.iter().any(|(u,r)| u.as_str()==url && r.status().is_connected()));
+                    retain_accepted_relays(&relays, &subscription, &mut accepted).await;
                     state.relay_diagnostics.write().await.retain(|url,_| desired.iter().any(|wanted| wanted.trim_end_matches('/') == url));
                     for (url,relay) in &relays {
                         let previous = state.relay_diagnostics.read().await.get(url.as_str().trim_end_matches('/')).cloned();
@@ -839,6 +848,23 @@ fn can_attempt_subscription(status: nostr_sdk::prelude::RelayStatus, attempts: u
             ))
 }
 
+async fn retain_accepted_relays(
+    relays: &std::collections::HashMap<nostr::prelude::RelayUrl, nostr_sdk::prelude::Relay>,
+    subscription: &nostr::prelude::SubscriptionId,
+    accepted: &mut std::collections::HashSet<String>,
+) {
+    let mut live = std::collections::HashSet::with_capacity(accepted.len());
+    for (url, relay) in relays {
+        if accepted.contains(url.as_str())
+            && relay.status().is_connected()
+            && relay.subscription(subscription).await.is_some()
+        {
+            live.insert(url.to_string());
+        }
+    }
+    *accepted = live;
+}
+
 async fn subscribe_relay(
     relay: &nostr_sdk::prelude::Relay,
     subscription: &nostr::prelude::SubscriptionId,
@@ -1049,5 +1075,40 @@ mod retry_tests {
             );
             assert!(!can_attempt_subscription(offline, 2));
         }
+    }
+
+    #[tokio::test]
+    async fn retain_accepted_relays_drops_connected_relay_without_subscription_registration() {
+        let local = LocalRelay::new();
+        local.run().await.unwrap();
+
+        let client = Client::new();
+        let url = local.url().await;
+        client.add_relay(url.clone()).await.unwrap();
+        client.connect().and_wait(Duration::from_secs(2)).await;
+        let relay = client.relay(url.clone()).await.unwrap().unwrap();
+
+        let keys = BTreeSet::from([Keys::generate().public_key()]);
+        let sub_id = SubscriptionId::generate();
+        subscribe_relay(&relay, &sub_id, &keys).await.unwrap();
+
+        let relays = client.relays().await;
+        let mut accepted = std::collections::HashSet::from([url.to_string()]);
+        retain_accepted_relays(&relays, &sub_id, &mut accepted).await;
+        assert!(
+            accepted.contains(url.as_str()),
+            "connected relay with a live registration must stay accepted"
+        );
+
+        let _ = relay.unsubscribe(&sub_id).await;
+        assert!(relay.status().is_connected());
+        retain_accepted_relays(&relays, &sub_id, &mut accepted).await;
+        assert!(
+            !accepted.contains(url.as_str()),
+            "connected relay missing SDK subscription registration must be dropped for recovery"
+        );
+
+        client.shutdown().await;
+        local.shutdown();
     }
 }
